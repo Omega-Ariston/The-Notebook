@@ -48,7 +48,7 @@
 - Flink API大体分为三个层次：底层ProcessFunction、中层Data Stream API、上层SQL/Table API。每层都依赖时间属性，但中层因封闭原因接触到时间的地方不多
 - 判断使用Event Time还是Processing Time：当应用遇到问题需要从Checkpoint恢复时，是否希望结果完全相同？是的话选择Event Time，可以接受不同就选择Processing Time，后者处理起来更简单
 - Processing Time使用本地节点时间，因此肯定是递增的，意味着消息有序，数据流有序
-- 如果单条数据之间乱序，就考虑对整个序列进行更大程度的离散化。也就是用更“大”的眼光去看待一批一批的数据，进行时间上的划分，保证划分后的时间区块之前有序。这时在区块间加入标记（特殊处理数据），叫做watermark，表示以后到来的数据不会再小于这个时间了
+- 如果单条数据之间乱序，就考虑对整个序列进行更大程度的离散化。也就是用更“大”的眼光去看待一批一批的数据，进行时间上的大粒度划分，保证划分后的时间区块之间有序。这时在区块间加入标记（特殊处理数据），叫做watermark，表示以后到来的数据不会再小于这个时间了
 - Timestamp分配与Watermark生成
     - Flink支持两种watermark生成方式
     1. 从SourceFunction产生，从源头就带上标记。通过调用collectWithTimestamp方法发送带时间戳的数据，或调用emitWatermark产生一条watermark，表示接下来不会有时间戳小于这个数值的记录
@@ -58,7 +58,7 @@
     - Watermark以广播的形式在算子之间进行传播
     - Long.MAX_VALUE表示不会再有数据
     - 单输入取其大，多输入取其小（短板效应）
-    - 局限在于，如果输入流来自多个流Join的结果，则有可能来自不同流的消息存在时间上的巨大差异，导致快流需要等慢流，就要缓存快流的数据，是一个很大的性能开销
+    - 局限在于，即便在单一输入流的情况下，如果该输入流来自多个流Join的结果，则有可能来自不同流的消息存在时间上的巨大差异，导致快流需要等慢流，就要缓存快流的数据，是一个很大的性能开销
 - ProcessFunction
     - Watermark在任务里的处理逻辑分为内部逻辑与外部逻辑，后者由ProcessFunction体现
     - 可以根据当前系统使用的时间语义去获取正在处理的记录的事件时间或处理时间
@@ -72,8 +72,46 @@
 - Table API中的时间
     - 需要把时间属性提前放到表的schema中（物化）
     - 时间列和Table操作：
-    1. Over窗口聚合
-    2. GroupBy窗口聚合
-    3. 时间窗口连接
-    4. 排序
-    - 这些操作必须在时间列上进行（数据流的一过性）或优先在时间列上进行（如按照其它列进行排序时必须先按时间排序），保证内部产生的状态不会无限增长下去
+        1. Over窗口聚合
+        2. GroupBy窗口聚合
+        3. 时间窗口连接
+        4. 排序
+    - 这些操作必须在时间列上进行（数据流的一过性）或优先在时间列上进行（如按照其它列进行排序时必须先按时间排序），保证内部产生的状态不会无限增长下去（最终前提）
+
+## 第三章 Checkpoint原理剖析与应用实践
+- Checkpoint是从source触发到下游所有节点完成的一次全局操作
+- State则是Checkpoint所做的主要持久化备份的主要数据
+- State的两种类型
+    1. keyed state：只能应用于KeyedStream的函数与操作中，如Keyed UDF，window state，每一个key只能属于某一个keyed state
+    2. operator state：又称为non-keyed state，每个state仅与一个operator实例绑定，常见的有source state，比如记录当前source的offset
+- State的另一种分类方式
+    1. Managed State（推荐）：由Flink管理的State，包含上面分类的两种
+    2. Raw State：Flink仅提供stream可以进行存储数据，对flink而言这些state只是一些bytes
+- State的使用
+    - keyed state：通过RuntimeContext.getState()方法访问，支持update()操作
+    - operator state：通过FunctionInitializationContext.getOperatorStateStore().getListState()方法访问，并在snapshotState()方法中将状态写入
+- State的存储
+    - statebackend的分类：
+        1. MemoryStateBackend
+        2. FsStateBackend
+        3. RocksDBStateBackend
+    - 1和2运行时存储于Java堆内存中，执行Checkpoint时2才会将数据以文件格式持久化到远程存储。3则借用了RocksDB对state进行保存（内存磁盘混合）
+    - 对于内存中state存储的两种实现方法：
+        1. 支持异步Checkpoint（默认）：存储格式CopyOnWriteStateMap
+        2. 仅支持同步Checkpoint：存储格式NestedStateMap
+    - HeapKeyedStateBackend中Checkpoint序列化数据阶段默认有最大5MB数据的限制
+- Checkpoint的执行机制
+    1. JM中的Checkpoint Coordinator负责发起Checkpoint，向所有Source节点trigger Checkpoint
+    2. source节点向下游广播barrier（实现Chandy-Lamport快照算法的核心），下游的task只有收到所有input的barrier才会执行相应checkpoint
+    3. 当task完成state备份后，将备份数据的地址（state handle）通知给Checkpoint Coordinator
+    4. 下游的sink节点收到所有input的barrier后会执行本地快照，将数据全量刷到持久化备份中并将State handle返回给Checkpoint Coordinator
+    5. 当Checkpoint Coordinator收到所有task的state handle，就认为这次checkpoint已全局完成，并向持久化存储中备份一个checkpoint meta文件
+- Checkpoint的Exactly-once语义
+    - 需要在对不同输入源传来的barrier进行对齐的阶段将收到的数据缓存起来，等对齐完再处理
+    - 对于At-Least-Once来说，无需缓存收集到的数据，而是直接做处理，所以导致restore时可能有数据被重复处理
+    - Flink只能保证计算过程Exactly-Once，端到端则需要Source和Sink支持
+- Checkpoint与Savepoint区别：
+    - 概念：Checkpoint是自动容错机制；Savepoint是程序全局状态镜像
+    - 目的：Checkpoint是程序自动容错、快速恢复；Savepoint是程序修改后继续从状态恢复，程序升级等
+    - 用户交互：Checkpoint下Flink系统行为，Savepoint是用户触发
+    - 状态文件保留策略：Checkpoint默认程序删除（可配置），Savepoint会一直保存到用户删除
