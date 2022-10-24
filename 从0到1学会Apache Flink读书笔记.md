@@ -169,3 +169,32 @@
     - 缺点：部署成本高、灵活性不够
 - Flink on Kubernetes暂时跳过
 
+## 第五章 数据类型和序列化
+- Flink中数据类型分类：
+    - 基础类型（Basic）：所有Java基础类型（装箱或不装箱）
+    - 数组（Arrays）：基础类型数组或对象数组
+    - 复合类型（Composite）
+    - 辅助类型（Auxiliary）：Flink Java Tuple、Scala Tuple、Row、POJO
+    - 泛型和其他类（Generic）：由Kryo提供序列化支持
+- TypeInformation是Flink类型系统的核心类，Flink中每一个具体的类型都对应了一个TypeInformation的实现类
+- TypeInformation亦可用于生成对应类型的序列化器TypeSerializer并用于执行语义检查，比如当字段作为join或grouping的键时，检查这些字段是否在该类型中存在
+- 对于大多数类型，Flink可以自动生成对应的序列化器，除了GenericTypeInfo需要靠Kryo。复合类型的序列化器同样是复合的
+- 实现TypeComparator可以定制类型的比较方式
+- Flink的序列化过程比Java的要省空间（省去类型信息）
+- 序列化的结果由Memory Segment支持，其为一个固定长度的内存，是Flink中最小的内存分配单元，相当于Java的Byte数组，每条记录都会以序列化的形式存在一个或多个Memory Segment中
+- 关于序列化需要注意的几个场景：
+    - 注册子类型：如果函数签名只描述了超类型，而实际执行过程中使用了子类型，让Flink了解子类型会大大提高性能。可以通过调用StreamExecutionEnvironment或ExecutionEnvironment的registertype()方法注册子类型信息
+    - 注册自定义序列化器：对于不适用于自己序列化框架的数据类型，Flink让Kryo帮忙，但有的类型无法与Kryo无缝连接，需要注册
+    - 添加类型提示：有时Flink无法推测出泛型信息，需要用户传入TypeHint类型提示（通常只在Java API中需要）
+    - 手动创建TypeInformation：某些API调用中是必须的，因为Java的泛型类型擦除机制
+- Flink无法序列化的类型会默认交给Kryo处理，如果Kryo还无法处理，有两个方案：
+    1. 强制使用Avro来代替Kryo：`env.getConfig().enableForceAvro();`
+    2. 为Kryo增加自定义的Serializer以增强其功能：`env.getConfig().addDefaultKryoSerializer(clazz, serializer);`
+- 亦可通过`Kryoenv.getConfig().disableGenericTypes()`来彻底禁用Kryo，但此时无法处理的类会导致异常
+- 通信层的序列化：
+    - Task之间如果需要跨网络传输数据记录，就需要将数据序列化之后写入 NetworkBufferPool，下层的Task读出之后再进行反序列化操作
+    - Flink 提供了数据记录序列化器（RecordSerializer）与反序列化器（RecordDeserializer）以及事件序列化器（EventSerializer）来保证上述过程正确执行
+    - Function 发送的数据被封装成 SerializationDelegate，它将任意元素公开为IOReadableWritable以进行序列化，通过setInstance()来传入要序列化的数据
+    - 确定Function的输入/输出类型：在构建 StreamTransformation时候通过TypeExtractor工具确定Function的输入输出类型。TypeExtractor 类可以根据方法签名、子类信息等蛛丝马迹自动提取或恢复类型信息
+    - 确定Function的序列化/反序列化器：构造StreamGraph时，在addOperator()的过程中指定（有点像Hive里Operator对应的Desc）
+    - 进行序列化/反序列化的时机：TM管理和调度Task，而Task调用StreamTask，StreamTask中封装了算子的真正处理逻辑。算子处理数据前会收到反序列化封装的数据StreamRecord，并在处理后通过Collector发给下游（构建Collector时已确定SerializationDelegate），序列化的操作交给SerializerDelegate处理
