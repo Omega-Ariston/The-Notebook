@@ -113,7 +113,7 @@
 - Checkpoint与Savepoint区别：
     - 概念：Checkpoint是自动容错机制；Savepoint是程序全局状态镜像
     - 目的：Checkpoint是程序自动容错、快速恢复；Savepoint是程序修改后继续从状态恢复，程序升级等
-    - 用户交互：Checkpoint下Flink系统行为，Savepoint是用户触发
+    - 用户交互：Checkpoint是Flink系统行为，Savepoint是用户触发
     - 状态文件保留策略：Checkpoint默认程序删除（可配置），Savepoint会一直保存到用户删除
 
 ## 第四章 Flink on Yarn/K8S原理剖析及实践
@@ -215,3 +215,41 @@
     4. ExecutionGraph -> 物理执行计划
         - 没什么好说的
 - **Flink1.5之后新加的Dispatcher可以通过按需分配Container的方式允许不同算子使用不同container配置，这里我没怎么看明白，日后回来填坑**
+
+## 第七章 网络流控及反压剖析
+- 为什么需要流控：Producer与Consumer吞吐量不一致，上游快的话会导致下游数据积压，如果缓冲区有限则新数据丢失，如果缓冲区无界内存会爆掉
+- 网络流控的实现：
+    - 静态限速：可以在Producer端实现类似Rate Limiter这样的静态限流，但局限性在于事先无法预估Consumer的承受速率，并且这个通常会动态地波动
+    - 动态反馈/自动反压：Consumer及时给Producer做feedback，告知自己能承受的速率，动态反馈分两种：
+        - 负反馈：接受速率小于发生速率时告知Producer降低发送率
+        - 正反馈：发送速率小于接收速率时告知Producer提高发送率
+- Flink做网络传输时数据的流向为Flink->Netty->Socket三级每级都有一个缓冲区，接收端也一样
+- Flink1.5之前直接通过TCP自带的流控实现feedback：通过ACK指定消息的offset，通过window指定消息大小（基于本地缓冲区内的消息处理情况，本地缓冲区就是一个滑动窗口）
+- TCP有一个ZeroWindowProbe机制可以防止当窗口大小为0时上游无法感知下游重生的数据请求。发送端会定期发送1字节的探测消息，接收端会把窗口大小进行反馈
+- ExecutionGraph中的Intermediate Result Partition用于上游发送数据，Input Gate用于下游读取数据
+- Flink中的反压传播需要考虑两种情况：
+    1. 跨TaskManager：反压如何从下游Input Gate传到上游ResultPartition
+    2. TaskManager内：反压如何从Result Partition传播到Input Gate
+- TaskManager中会有一个统一的Network BufferPool被所有Task共享，在初始化时会从堆外内存中申请内存（无需依赖GC释放空间）。之后可以为每个ResultSubPartition创建Local BufferPool
+- 对于跨TM的反压：
+    - 当Input Gate使用的Local BufferPool用完时，会向Network BufferPool申请新空间（有上限），再用完时会直接禁掉Netty Autoread
+    - Netty停止从Socket读取数据后，Socket的缓冲区很快也满了
+    - Socket会把Window=0发送给发送端（TCP的滑动窗口机制）
+    - 发送端Socket停止发送之后，它的Buffer也很快就会堆满
+    - Netty检测到Socket无法写之后，会停止向Socket写数据
+    - Netty停止写后，很快自己的Buffer会水涨船高，但它的Buffer是无界的，可以通过Netty的水位机制中high watermark来控制上界，超过后会将其channel置为不可写
+    - ResultSubPartition在写之前会检测Netty是否可写，不可写就不写了
+    - 压力这时给到ResultSubPartition，它也会向Local BufferPool和Network BufferPool申请内存
+    - 发送端的Local BufferPool达到上限后整个Operator都会停止写数据，反压目的达成
+- 对于TM内的反压：
+    - ResultSubPartition无法继续写入数据后，Record Writer的写也会被阻塞
+    - Operator的输入和输出在同一线程执行，Writer阻塞了，Reader也会停止从InputChannel读数据
+    - 上游还在不停地发，最终这个TM的Input Gate的Buffer会被耗尽，就变成前面那种情况了
+- Flink1.5之后使用Credit-based的反压策略
+- 基于TCP的反压策略弊端在于堵塞的链条太长，生效延迟也大，并且单个task导致的反压会阻断整个TM的socket，连checkpoint barrier都发不出去了
+- 所谓的Credit-based就是在Flink的层面实现类似TCP流控的反压机制，类似window
+- Credit-based的反压机制：
+    - 每次ResultSubPartition向InputChannel发送消息时都会发送一个backlog size，告诉下游准备发送多少消息
+    - 下游会计算自己有多少Buffer可以用于接收消息，如果充足，就返还给上游一个Credit，表示准备好了（底层还是用Netty和Socket通信），如果不足就去申请Local BufferPool，直到达到上限，则返回Credit=0
+    - ResultSubPartition接收到Credit=0后就不再向Netty传输数据，上游TM的Buffer也会很快耗尽，这样就不用从Socket到Netty这样一层层向上反馈，降低了延迟，并且Socket也不会被堵
+- 某些场景仍然需要静态反压，比如有的外部存储（ES）无法把反压传播给Sink端，就需要用静态限速的方式在Source端做限流
