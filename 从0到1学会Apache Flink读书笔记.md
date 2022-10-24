@@ -115,3 +115,57 @@
     - 目的：Checkpoint是程序自动容错、快速恢复；Savepoint是程序修改后继续从状态恢复，程序升级等
     - 用户交互：Checkpoint下Flink系统行为，Savepoint是用户触发
     - 状态文件保留策略：Checkpoint默认程序删除（可配置），Savepoint会一直保存到用户删除
+
+## 第四章 Flink on Yarn/K8S原理剖析及实践
+- Flink架构概览——Job
+    - 用户通过DataStream API、DataSet API、SQL和Table API编写Flink任务，会生成一个JobGraph
+    - JobGraph由source、map()、keyBy()/window()/apply()和Sink等算子组成
+    - JobGraph提交给Flink集群后，能以Local、Standalone、Yarn和Kubernetes四种模式运行
+- Flink架构概览——JobManager
+    - 负责将JobGraph转换为Execution Graph并最终拿来运行
+    - Scheduler组件负责Task的调度
+    - Checkpoint Coordinator组件负责协调整个任务的Checkpoint，包括开始与完成
+    - 通过Actor System与TaskManager通信
+    - 其它功能，例如Recovery Metadata，用于进行故障恢复时，可以从Metadata里读取数据
+- Flink架构概览——TaskManager
+    - 负责具体任务的执行过程，在JM申请到资源后开始启动
+    - 主要组件：
+        - Memory&I/OManager，内存与IO管理
+        - Network Manager，对网络方面进行管理
+        - Actor system，负责网络通信
+    - 被分为很多个TaskSlot，每个任务都要运行在slot里面，是调度资源的最小单位
+- Flink的Standalone模式
+    - Master和TM可以运行在同一台机器上，也可以不同
+    - Master进程中，Standalone ResourceManager负责对资源进行管理。用户提交JobGraph给Master时要先经过Dispatcher
+    - Dispatcher收到请求后会生成一个JM，然后JM向RM申请资源，再启动TM
+    - TM启动后会向JM注册，之后JM再将具体的Task发给TM执行
+- 运行时相关组件：Client->JobManager->TaskManager
+- Flink on Yarn原理
+    - Yarn任务执行过程：
+        1. Client端提交任务给RM
+        2. RM通知NM启动Container，并在其上启动AM
+        3. AM启动后向RM注册，并重新申请资源
+        4. RM向AM分配资源，AM将具体的Task调度执行
+    - Yarn集群中的组件：
+        - RM：负责处理客户端请求、启动/监控AM、监控NM、资源分配与调度、包含Scheduler与ASM
+        - AM：运行于Slave机上，负责数据切分、申请资源和分配、任务监控和容错
+        - NM：运行于Slave机上，用于单节点资源管理、AM/RM通信及汇报状态
+        - Container：对资源进行抽象，包括内存、CPU、磁盘、网络等
+    - Per-Job模式工作流程：
+        1. Client提交Yarn App，比如JobGraph或JARs
+        2. RM申请一个Container，用于启动AM，AM进程中运行Flink程序，即Flink-Yarn RM以及JobManager
+        3. F-YRM向RM申请资源，申请到之后启动TM
+        4. TM启动后向FYRM注册自己，成功后JM将具体任务发给TM
+        - （这个模式下似乎没有Dispatcher）
+    - Session模式工作流程：
+        - 这个模式下Client会直接提交一个Flink-Session作为Yarn App
+        - AM进程里面会包含可复用的F-YRM和Dispatcher（用于直接接收Client发来的Job）
+        - Dispatcher收到请求后会在AM中启动对应的JM，多个请求会对应多个JM，每个JM在任务结束后资源不会释放
+        - 多个JM共用一个Dispatcher和F-YRM
+    - Yarn模式优点
+        - 资源的统一管理和调度：以Container作为调度单位，可自定义调度策略
+        - 资源隔离：Container资源抽象
+        - 自动failover处理：NM监控及AM异常恢复
+    - 缺点：部署成本高、灵活性不够
+- Flink on Kubernetes暂时跳过
+
