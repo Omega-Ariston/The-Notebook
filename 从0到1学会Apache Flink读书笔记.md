@@ -43,3 +43,37 @@
     - 对于批作业而言，可以使用Regional重启的策略。一条Pipeline作业处理线就是一个Region（两端以批作业分隔），因为region之间数据会缓存，因此regin可以单独重启。此时ExecutionGraph可以划分为多个子图（有点像MapReduce里不同的Stage）
     - 在Region策略中，如果上游输出结果时出现问题（如TaskExecutor异常退出等），则还需要重启上游Region来重新产生相应数据。若上游输出数据的分发方式不确定（KeyBy、Broadcast属于确定，Rebalance、Random属于不确定），则为了保证结果正确性，还需要把上游region对应的所有下游region也一块重启
     - Flink集群支持多个Master备份，如果Master挂了，可以通过Zookeeper重新选主并接管工作，但为了准确维护作业状态，需要重启整个作业（有改进空间）
+
+## 第二章 时间属性深度解析
+- Flink API大体分为三个层次：底层ProcessFunction、中层Data Stream API、上层SQL/Table API。每层都依赖时间属性，但中层因封闭原因接触到时间的地方不多
+- 判断使用Event Time还是Processing Time：当应用遇到问题需要从Checkpoint恢复时，是否希望结果完全相同？是的话选择Event Time，可以接受不同就选择Processing Time，后者处理起来更简单
+- Processing Time使用本地节点时间，因此肯定是递增的，意味着消息有序，数据流有序
+- 如果单条数据之间乱序，就考虑对整个序列进行更大程度的离散化。也就是用更“大”的眼光去看待一批一批的数据，进行时间上的划分，保证划分后的时间区块之前有序。这时在区块间加入标记（特殊处理数据），叫做watermark，表示以后到来的数据不会再小于这个时间了
+- Timestamp分配与Watermark生成
+    - Flink支持两种watermark生成方式
+    1. 从SourceFunction产生，从源头就带上标记。通过调用collectWithTimestamp方法发送带时间戳的数据，或调用emitWatermark产生一条watermark，表示接下来不会有时间戳小于这个数值的记录
+    2. 使用DataStream API时指定，调用assignTimestampAndWatermarks方法，传入不同的timestamp和watermark生成器（watermark由时间驱动或事件驱动，每次分配timestamp时都会调用watermark生成方法）
+    - 建议生成的工作尽量靠近数据源
+- Watermark传播
+    - Watermark以广播的形式在算子之间进行传播
+    - Long.MAX_VALUE表示不会再有数据
+    - 单输入取其大，多输入取其小（短板效应）
+    - 局限在于，如果输入流来自多个流Join的结果，则有可能来自不同流的消息存在时间上的巨大差异，导致快流需要等慢流，就要缓存快流的数据，是一个很大的性能开销
+- ProcessFunction
+    - Watermark在任务里的处理逻辑分为内部逻辑与外部逻辑，后者由ProcessFunction体现
+    - 可以根据当前系统使用的时间语义去获取正在处理的记录的事件时间或处理时间
+    - 可以获取当前算子的时间（可以理解为watermark）
+    - 可以注册timer，允许watermark达到某个时间点时触发定时器的回调逻辑。比如实现缓存的自动清除
+- Watermark处理
+    - 当算子实例收到Watermark时
+    1. 首先要更新当前的算子时间，以便让ProcessFunction获取
+    2. 遍历计时器队列，查看是否有事件需要触发
+    3. 遍历计时器的队列，逐一触发用户定义的回调逻辑
+- Table API中的时间
+    - 需要把时间属性提前放到表的schema中（物化）
+    - 时间列和Table操作：
+    1. Over窗口聚合
+    2. GroupBy窗口聚合
+    3. 时间窗口连接
+    4. 排序
+    - 这些操作必须在时间列上进行（数据流的一过性）或优先在时间列上进行（如按照其它列进行排序时必须先按时间排序），保证内部产生的状态不会无限增长下去
