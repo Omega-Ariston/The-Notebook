@@ -280,3 +280,13 @@
 - Flink Kafka Producer
     - Producer分区：默认用（taskID%partition个数）来分区，此时若sink数量少于partition，会有partition没人写入。这时将partitioner设置为null就会改用round robin，且数据有key时会做分区散列
     - 容错：使用参数setFlushOnCheckpoint，控制在checkpoint时flush数据到kafka，保证数据已写入到kafka，能达到at-least-once语义。否则缓存在kafka的数据有可能丢（Flink kafka 011版本通过两阶段提交的sink结合kafka事务可以做到端到端Exactly-once）
+
+## 第十章 Flink State最佳实践
+- 再来讲讲两种state的区别：
+    1. 是否存在当前处理的key（current key）：operator state没有，keyed state数值总与一个Current key对应
+    2. 存储对象是否on heap：oeprator state backend仅有on-heap实现，keyed state backend有on/off heap（RocksDB）
+    3. 是否需要手动声明snapshot和restore方法：operator state需要手动实现这俩方法；keyed state由backend自行实现，对用户透明
+    4. 数据大小：operator state数据规模较小；keyed state相对较大（这个结论是经验判断，不是绝对判断）
+- 一般生产中会选择FsStateBackEnd或RocksDBStateBackEnd，前者性能更好，日常存储于堆内存，有OOM风险，不支持增量checkpoint；后者无需担心OOM，大部分时候选这个
+- 正确地清空当前state：state.clear()只能清除当前key对应的value，如果要清空整个state，需要借助applyToAllKeys方法。如果只是想清除过期state，用state TTL功能的性能会更好
+- 
