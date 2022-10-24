@@ -253,3 +253,30 @@
     - 下游会计算自己有多少Buffer可以用于接收消息，如果充足，就返还给上游一个Credit，表示准备好了（底层还是用Netty和Socket通信），如果不足就去申请Local BufferPool，直到达到上限，则返回Credit=0
     - ResultSubPartition接收到Credit=0后就不再向Netty传输数据，上游TM的Buffer也会很快耗尽，这样就不用从Socket到Netty这样一层层向上反馈，降低了延迟，并且Socket也不会被堵
 - 某些场景仍然需要静态反压，比如有的外部存储（ES）无法把反压传播给Sink端，就需要用静态限速的方式在Source端做限流
+
+## 第八章 详解Metrics原理与实战 暂时用不上  
+## 第九章 Flink Connector开发
+- Flink有四种数据读写方式
+    1. Flink预定义的Source和Sink
+        - 基于文件的Source/Sink
+        - 基于Socket的Source/Sink
+        - 基于Collections、Iterators的Source；标准输出/标准错误
+    2. Flink自带的Boundled connectors
+        - 例如Kafka source与sink，Es sink等
+        - 在二进制发布包中没有，提交job的jar包记得要把相关connector打进去
+    3. 第三方Apache Bahir项目中提供的连接器
+        - 从Apache Spark中独立出来的项目
+        - 提供flume、redis连接器（sink）
+    4. 通过异步IO
+        - 常见场景是关联MySQL中某个表
+- Flink Kafka Connector
+    - 针对不同kafka版本提供了不同的consumer/producer
+- Flink Kafka Consumer
+    - 提供了反序列化（数据在kafka中是二进制字节数组）的schema类
+    - 封装了消费offset位置设置的api
+    - 支持topic和partition动态发现（使用独立线程定期获取kafka元数据，并且topic用正则表达式配置）
+    - commit offset的方式：如果checkpoint关闭，则依赖于kafka客户端的auto-commit机制。如果checkpoint打开，则Flink在自己的State里管理消费的offset，此时提交kafka仅作为外部监视消费进度（通过setCommitOffsetsOnCheckpoints()来设置当checkpoint成功提交时提交offset到kafka）
+    - Timestamp Extraction/Watermark生成：每个partition一个assigner，watermark为多个partition对齐后值（在source前而不是后对齐，以避免出现数据丢失）
+- Flink Kafka Producer
+    - Producer分区：默认用（taskID%partition个数）来分区，此时若sink数量少于partition，会有partition没人写入。这时将partitioner设置为null就会改用round robin，且数据有key时会做分区散列
+    - 容错：使用参数setFlushOnCheckpoint，控制在checkpoint时flush数据到kafka，保证数据已写入到kafka，能达到at-least-once语义。否则缓存在kafka的数据有可能丢（Flink kafka 011版本通过两阶段提交的sink结合kafka事务可以做到端到端Exactly-once）
