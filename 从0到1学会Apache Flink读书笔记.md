@@ -166,7 +166,10 @@
         - 资源的统一管理和调度：以Container作为调度单位，可自定义调度策略
         - 资源隔离：Container资源抽象
         - 自动failover处理：NM监控及AM异常恢复
-    - 缺点：部署成本高、灵活性不够
+    - Yarn模式缺点
+        - 资源分配静态，无法根据负载返还或扩展资源
+        - 所有的container大小固定，无法区分CPU密集型与IO密集型作业
+        - 作业管理页面会在作业完成后消失不可访问
 - Flink on Kubernetes暂时跳过
 
 ## 第五章 数据类型和序列化
@@ -198,3 +201,17 @@
     - 确定Function的输入/输出类型：在构建 StreamTransformation时候通过TypeExtractor工具确定Function的输入输出类型。TypeExtractor 类可以根据方法签名、子类信息等蛛丝马迹自动提取或恢复类型信息
     - 确定Function的序列化/反序列化器：构造StreamGraph时，在addOperator()的过程中指定（有点像Hive里Operator对应的Desc）
     - 进行序列化/反序列化的时机：TM管理和调度Task，而Task调用StreamTask，StreamTask中封装了算子的真正处理逻辑。算子处理数据前会收到反序列化封装的数据StreamRecord，并在处理后通过Collector发给下游（构建Collector时已确定SerializationDelegate），序列化的操作交给SerializerDelegate处理
+
+## 第六章 Flink作业执行深度解析
+- Flink的四层转换流程：
+    1. Program -> StreamGraph
+        - 从Source节点开始，每一次transform生成一个StreamNode，两个StreamNode通过StreamEdge连接，Node和Edge一起构成DAG
+        - StreamNode有四种transform形式：Source、Flat Map、Window、Sink
+    2. StreamGraph -> JobGraph
+        - 从Source节点开始，遍历寻找能够嵌到一起的operator，能嵌就嵌，不能嵌的单独生成JobVertex，通过JobEdge连接JobVertex，形成JobVertex层面的DAG
+        - 配置Checkpoint在这一步完成，因此需要为每个节点生成byte数组类型的hash值，以获取恢复状态
+    3. JobGraph -> ExecutionGraph
+        - 从Source节点开始排序，根据JobVertex生成ExecutionJobVertex，根据JobVertex的IntermediateDataSet构建IntermediateResult，并用Result构建上下游依赖关系，形成ExecutionJobVertex层面的DAG，也就是ExecutionGraph
+    4. ExecutionGraph -> 物理执行计划
+        - 没什么好说的
+- **Flink1.5之后新加的Dispatcher可以通过按需分配Container的方式允许不同算子使用不同container配置，这里我没怎么看明白，日后回来填坑**
