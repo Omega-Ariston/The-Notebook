@@ -214,7 +214,7 @@
         - 从Source节点开始排序，根据JobVertex生成ExecutionJobVertex，根据JobVertex的IntermediateDataSet构建IntermediateResult，并用Result构建上下游依赖关系，形成ExecutionJobVertex层面的DAG，也就是ExecutionGraph
     4. ExecutionGraph -> 物理执行计划
         - 没什么好说的
-- **Flink1.5之后新加的Dispatcher可以通过按需分配Container的方式允许不同算子使用不同container配置，这里我没怎么看明白，日后回来填坑**
+- **Flink1.5之后新加的Dispatcher可以通过按需分配Container的方式允许不同算子使用不同container配置，这里我暂时想不到具体实现方法，日后回来填坑**
 
 ## 第七章 网络流控及反压剖析
 - 为什么需要流控：Producer与Consumer吞吐量不一致，上游快的话会导致下游数据积压，如果缓冲区有限则新数据丢失，如果缓冲区无界内存会爆掉
@@ -289,4 +289,17 @@
     4. 数据大小：operator state数据规模较小；keyed state相对较大（这个结论是经验判断，不是绝对判断）
 - 一般生产中会选择FsStateBackEnd或RocksDBStateBackEnd，前者性能更好，日常存储于堆内存，有OOM风险，不支持增量checkpoint；后者无需担心OOM，大部分时候选这个
 - 正确地清空当前state：state.clear()只能清除当前key对应的value，如果要清空整个state，需要借助applyToAllKeys方法。如果只是想清除过期state，用state TTL功能的性能会更好
-- 
+
+## 第十一章 TensorFlow On Flink 我暂时用不上
+## 第十二章 深度探索Flink SQL
+- Blink Planner中SQL/Table API转化为Job Graph的流程：
+    1. SQL/Table API解析验证：SQL会被解析成SqlNode Tree抽象语法树，然后做验证，会访问FunctionManager（查询用户定义的UDF以及是否合法）和CatalogManager（检查Table或Database是否存在），验证通过后会生成一个Operation DAG
+    2. 生成RelNode：Operation DAG会被转化为RelNode（关系表达式） DAG
+    3. 优化：优化器基于规则和统计信息对RelNode做各种优化，Blink Planner中绝大部分的优化规则都是Stream Batch共享的。但差异在于Batch没有状态的概念，而Stream不支持sort，所以Blink Planner还是定义了两套规则集以及对应的Physical Rel：BatchPhysicalRel和StreamPhysicalRel。优化完之后生成的是PhysicalRelDAG
+    4. 转化：PhysicalRelDAG会继续转化为ExecNode，属于执行层（Blink）的概念。ExecNode中会进行大量的CodeGen操作，还有非Code的Operator操作，最终生成Transformation DAG
+    5. 生成可执行Job Graph：Transformation DAG最终被转化成Job Graph，完成了整个解析过程
+- 批处理模式下reuse-source优化可能会导致死锁，具体场景是在执行 hash-join或者nested-loop-join时一定是先读build端再读probe端，如果启用reuse-source-enabled，当数据源是同一个Source时，Source的数据会同时发送给build和probe端。这时build端的数据将不会被消费，导致join操作无法完成，整个join就被卡住（Stream模式不会有死锁，因为不涉及join选边）
+- 为了解决死锁问题，Blink Planner会先将probe端数据落盘（因此会多一次磁盘写操作，需要权衡），这样build端读数据的操作才会正常，等build端数据全部读完之后，再从磁盘中拉取probe端的数据，从而解决死锁（**这不就有点像我做的那个动态分区裁剪功能？**）
+- 这一部分讲的很多SQL执行层面的优化思路其实和hive是有一定共通之处的，尤其是批处理模式下的优化规则。但流模式下一旦数据源从有界变为无界之后，看待问题（比如聚合的优化）的方式需要做一些改变，这个是日后需要关注的部分
+
+## 第十三章 Python API应用实践 我暂时用不上
