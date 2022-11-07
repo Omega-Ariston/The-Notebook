@@ -137,3 +137,22 @@
     - 对MapFile进行写入时map条目必须顺序添加，否则会抛出IOException
     - Hadoop在MapFile上提供了一些变种：SetFile、ArrayFile、BloomMapfile（测试通过时才调用get()方法，对稀疏文件管用）
     - 顺序文件、map文件和Avro数据文件都是面向行的，Hadoop中面向列的格式有RC（被后两者取代）、ORC、Parquet。Avro也有面向列的文件格式Trevni
+
+## 第二部分 关于MapReduce
+### 第六章 MapReduce应用开发
+- 多个资源文件可以按顺序通过addResource()方法添加到Configuration中，后添加的会覆盖前添加的属性，除非属性的final字段设置为true（此时会弹出警告）
+- 通过System.setProperty()或JVM参数-Dproperty=value设置的属性优先级高于资源文件中定义的属性
+- 系统属性需要使用配置属性重新定义，否则无法通过配置API进行访问
+- 客户端的类路径由以下几个部分组成：
+    - 作业的jar文件
+    - 作业jar文件的lib目录中所有jar文件以及classes目录
+    - HADOOP_CLASSPATH定义的类路径
+- 集群上用户任务的类路径由以下几个部分组成：
+    - 作业的jar文件
+    - 作业jar文件的lib目录中所有jar文件以及classes目录
+    - 使用-libjars或DistributedCache的addFileToClassPath()方法（老版本API）或Job（新版本API）添加到分布式缓存的所有文件
+- 对于客户端和任务类路径，可以分别通过HADOOP_USER_CLASSPATH_FIRST环境变量和mapreduce.job.user.classpath.first参数来将用户的类路径优先放到搜索顺序中（默认在最后），以优先使用用户版本类库（会改变Hadoop框架依赖类，慎用）
+- 作业历史文件由Application Master以JSON格式存放在HDFS中，会保存一周后删除
+- 可以在作业中的自行添加Counter并在Context中对其进行操作以用于DEBUG
+- 任务的中间结果文件可以通过参数将其保留。也可以通过YARN配置任务尝试文件的删前保留时间
+- JobControl的实例表示一个作业的运行图，用户可以加入作业配置，并设置实例作业间的依赖关系
