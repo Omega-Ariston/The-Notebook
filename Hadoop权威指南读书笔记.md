@@ -264,6 +264,59 @@
     - 当使用文本输入格式时可以设置最大接受行长度以避免文件损坏（通常表现为超长行）而导致内存溢出
     - MultipleInputs类允许为每条输入路径指定InputFormat和Mapper，在addInputPath()时作为参数传入
 - 输出格式
-    - MapFileOutputFormat把map文件作为输出，但MapFile中的键必须顺序添加，因此必须确保reducer输出的键已经排好序
+    - MapFileOutputFormat把MapFile（排好序的SequenceFile）作为输出，但MapFile中的键必须顺序添加，因此必须确保reducer输出的键已经排好序
     - MultipleOutputFormat可以对输出文件名进行控制或让每个reducer输出多个文件，通过调用MultipleOutputs的write()方法
     - LazyOutputFormat可以等指定分区第一条记录输出时才真正创建输出文件（FileOutputFormat的子类会直接产生输出文件，即使是空的）
+
+## 第九章 MapReduce的特性
+- 计数器
+    - Hadoop为每个作业维护若干计数器，以描述多项指标，它们的分组为：
+    1. 任务计数器：
+        - 由其关联任务维护，并定期发送给AM
+        - 每次传输完整值，而非增量，以避免由于消息丢失引发错误
+        - 若任务失败，则相应计数器值会减少
+    2. 作业计数器：
+        - 由AM维护，因此无需在网络间传输数据
+        - 作业级别的统计量，值不会随着任务运行而改变
+    3. 用户定义的Java计数器
+        - 可在mapper或reducer中增加，由Java枚举类型定义，以便进行分组（枚举类名即为组名，字段名即为计数器名）
+        - 计数器是全局的，框架会跨所有map和reduce做收集，作业结束时产生最终结果
+        - 可以使用getCounter()的String入参重载方法来动态地创建计数器
+        - Job对象的getCounter()可以返回该作业的所有计数器
+    4. 用户定义的Streaming计数器
+        - 使用Streaming的MapReduce程序可以向标准错误流发送一行特殊格式的信息来增加计数器的值
+- 排序
+    - 键的排列顺序由RawComparator控制，规则为：
+        1. 若Comparator Class由参数或setSortComparatorClass()方法显式设置，则使用该类的实例
+        2. 否则，键必须是WritableComparable的子类，并使用针对该键类的已登记的comparator
+        3. 如果没有已登记的comparator，则使用RawComparator，将字节流反序列化为一个对象，再由WritableComparable.compareTo()方法做比较
+    - 全排序：
+        - 简单粗暴的方法是使用单个reduce任务，低效
+        - 另一种高效的方法是将数据以键范围进行分片，这样每个范围内排好序后将所有分片做拼接即可。但有可能导致数据不均匀，可以通过客户端数据采样解决（InputSampler）
+    - 辅助排序：
+        - 实现按值排序：定义包括自然键和自然值的组合键，根据组合键对记录进行排序，针对组合键进行分区和分组时只考虑自然键
+- 连接（Reduce端）
+    - Reduce端连接的输入源往往有多种格式，可以使用MultipleInputs类来方便地解析和标注各个源
+    - Reducer会从不同源中选出键相同的记录，但这些记录不保证为排序记录。实践中往往需要一个源的数据排列在另一个源的数据前面以更好地执行连接（小表在前）。可以通过上一节的辅助排序达到目标
+- 边数据分布
+    - 边数据（side data）是作业所需的额外只读数据，以辅助处理主数据集。面临的主要挑战是如何使散布在集群中的所有map和reduce任务都能够方便且高效地访问这些数据
+    1. 利用JobConf来配置作业
+        - Configuration类的各种setter方法可以方便地配置作业的任一键值对，对任务传递少量元数据时非常管用
+        - 任务中用户可以通过Context.getConfiguration()方法获得配置信息
+        - 对于复杂对象需要用户自己实现对象与字符串之间的双向转换机制，或使用Hadoop提供的Stringifier类。这部分会加大MapReduce组件的内存压力，因此数据量不宜过大
+        - 作业配置总是由客户端、AM和任务JVM读取，所有项会被读到内存中（包括不用的）
+    2. 分布式缓存
+        - 能够在任务运行过程中及时地将文件和存档复制到任务节点以供使用，为节约带宽，各个文件通常只需要复制到一个节点一次
+        - 工作机制：当用户启动一个作业，Hadoop会把由-file、-archives、-libjars等选项（亦可使用分布式缓存API）指定的文件复制至分布式文件系统中，并在任务运行之前由NM将文件从分布式文件系统复制到本地磁盘使其本地化（以符号链接的方式指向任务的工作目录）。-libjars指定的文件还会在任务启动前添加到任务的CLASSPATH中
+        - NM会为节点中缓存的文件维护一个计数器来统计其使用情况，任务即将运行时相关的文件对应的计数器+1，执行完毕后再-1。当计数达到0时才有资格删除。当缓存容量超出上限（默认10GB）时会以LRU方式腾出空间装载新文件
+        - **该机制不保证同一节点上运行的同一作业的后续任务肯定能在缓存中找到文件，但是成功的概率很大。因为作业的多个任务在调度后几乎同时开始运行，不会有足够多的其它作业在运行而导致原始任务的文件从缓存中被删除**
+        - 缓存中可以存放两类对象：文件和存档，前者会直接放入任务节点，后者会先解包再放入任务节点
+- MapReduce库类
+    - Hadoop还为mapper和reducer提供了一个包含常用函数的库，比如
+    - ChainMapper, ChainReducer：在一个mapper中运行多个mapper，在一个reducer中运行多个reducer，以降低磁盘IO开销
+    - FieldSelectionMapReduce：能从输入键和值中选择字段并输出键和值的mapper和reducer
+    - IntSumReducer, LongSumReducer：对各键的所有整数值执行求和操作的reducer
+    - InverseMapper：交换键和值的mapper
+    - MultithreadedMapper：能在多个独立线程中并发运行mapper的mapper，使用CPU牛逼的mapper的使用
+    - TokenCountMapper：将输入值用Java的StringTokenizer分解成独立单词并输出每个单词及count值1的mapper
+    - RegexMapper：检查输入值是否匹配某正则表达式，输出匹配字符串和count值1的mapper
