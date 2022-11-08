@@ -246,7 +246,7 @@
     - 任务级别上也可以做此操作，在setupTask()中设置（默认什么也不做），任务的提交阶段是可选的，此时框架不会为其运行分布式提交协议，打开时框架会保证特定任务有多个attempt的情况下只有一个会成功提交
 - 可以设置将map任务和reduce任务的输出直接写到分布式文件系统如HDFS上，以实现比单个键值对更大的灵活性
 
-## 第八章 MapReduce的类型与格式
+### 第八章 MapReduce的类型与格式
 - 由于Java编译期的泛型擦除机制，map和reduce任务的输入/输出类型必须显式设置，并且不兼容类型只有在运行时才会被检测出来（实践中可先以少量数据跑一次任务用以检测）
 - Streaming相关的东西暂时跳过
 - 输入格式
@@ -268,7 +268,7 @@
     - MultipleOutputFormat可以对输出文件名进行控制或让每个reducer输出多个文件，通过调用MultipleOutputs的write()方法
     - LazyOutputFormat可以等指定分区第一条记录输出时才真正创建输出文件（FileOutputFormat的子类会直接产生输出文件，即使是空的）
 
-## 第九章 MapReduce的特性
+### 第九章 MapReduce的特性
 - 计数器
     - Hadoop为每个作业维护若干计数器，以描述多项指标，它们的分组为：
     1. 任务计数器：
@@ -317,6 +317,29 @@
     - FieldSelectionMapReduce：能从输入键和值中选择字段并输出键和值的mapper和reducer
     - IntSumReducer, LongSumReducer：对各键的所有整数值执行求和操作的reducer
     - InverseMapper：交换键和值的mapper
-    - MultithreadedMapper：能在多个独立线程中并发运行mapper的mapper，使用CPU牛逼的mapper的使用
+    - MultithreadedMapper：能在多个独立线程中并发运行mapper的mapper，适合CPU牛逼的mapper的使用
     - TokenCountMapper：将输入值用Java的StringTokenizer分解成独立单词并输出每个单词及count值1的mapper
     - RegexMapper：检查输入值是否匹配某正则表达式，输出匹配字符串和count值1的mapper
+
+### 第十章 构建Hadoop集群
+- 对于“集群到底应该要多大”而言，“集群需要增长得多快”是个更有意义的问题
+- 网络拓扑：一般来说，Hadoop集群架构包含两级网络拓扑。各机架装配30-40个服务器，共享一个10GB交换机，各机架的交换机上又通过上行链路与一个核心交换机或路由器（至少10GB）互联。因此机架内部节点间的总带宽要远高于不同机架上节点间的带宽
+- Hadoop需要配置来了解网络拓扑状态以获得最好的性能与弹性的平衡。ScriptBasedMapping会运行用户定义的脚本来描述映射关系。脚本的存放路径由net.topology.script.file.name控制。不配置的话就全都分到一块去了
+- Hadoop并没有把所有配置文件放在一个单独的全局位置中，而是每个节点都各自保存一系列配置并由管理员完成配置的同步。一般的集群管理工具都提供这个功能
+- 当集群新引入的机器与原来规格不同时会需要两套配置以充分利用新硬件资源，便需要引入“机器类”的概念，把机器进行分组并各自维护一系列配置。Hadoop暂时没这能力，需要借助外部工具如Chef、Puppet、CFEngine和Bcfg2
+- 从HDFS读文件时，若要读取的数据块与客户端在同一节点，可以通过启用短回路本地读来避免网络传输（基于套接字实现）
+- 这一章有很多具体配置相关的内容，暂时用不上
+- Hadoop的安全机制：Kerberos只做身份验证，Hadoop只做权限控制
+- Kerberos取得许可步骤：
+    1. 认证：客户端向认证服务器发送一条报文，并获取一条带时间戳的票据授予票据（Ticket-Granting Ticket，TGT）
+    2. 授权：客户端使用TGT向票据授予服务器（Ticket-Granting Server，TGS）请求一个服务票据
+    3. 服务请求：客户端向服务器出示服务票据以证明自己。该服务器提供客户端需要的服务，在Hadoop中可以是Namenode或RM
+    - 2和3并非用户级别行为，客户端会做这些事情
+    - 认证步骤需要用户使用kinit命令并输入密码，但不代表每次都要，因为申请到的TGT具备一定的有效期（默认10小时，可设为1周）。更通用的做法是在登录操作系统的时候自动执行认证操作
+    - 不想输密码的话可以用ktutil命令创建一个keytab，可以用kinit -t将其传入
+- 为了避免高负载集群对KDC造成压力，Hadoop使用委托令牌支持后续认证访问，避免多次访问KDC。这个令牌的创建过程对用户是透明的，用户就执行kinit就好了
+- 委托令牌由服务器创建（这里指namenode），为客户端与服务器之间共享的密文。首次取得Kerberos认证并成功访问namenode时，客户端会从namenode获取一个委托令牌（由服务器使用密钥创建）
+- 客户端需要使用一种特殊类型的委托令牌来执行HDFS块操作，称为块访问令牌（block access token）。当客户端向namenode发出元数据请求时会从服务器获取该令牌并用于向datanode认证（namenode与datanode之间用心跳分享密钥）。这个功能可以用参数开关
+- 在MapReduce中，AM共享HDFS中的作业资源和元数据（jar、分片、配置等）。用户代码运行于NM中对HDFS进行访问。作业运行过程中这些组件使用委托令牌访问HDFS，结束时令牌失效
+- 如果作业要访问别的HDFS集群，要做相应配置修改来获取相应的令牌
+- 这章还介绍了一些别的安全性改进
