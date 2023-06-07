@@ -82,6 +82,9 @@
 - 一般意义上的Scan都无法通过布隆过滤器来提升扫描数据性能，因为key不确定，但在某些特定场景下Scan操作可以借其提升性能，如对于ROWCOL类型的过滤器，在Scan操作中明确指定需要扫某些列。
 - 在Scan过程中，碰到KV数据从一行换到新一行时，没法走ROWCOL布隆过滤器，因为新一行的Key值不确定，但是在同一行数据内切换列时可以进行优化，因为rowkey确定，同时column也已知
 
+## 第3章 HBase依赖服务
+- 主要讲了Zookeeper和HDFS，暂时跳过
+
 ## 第4章 HBase客户端
 ### 4.1 HBase客户端实现
 - HBase提供了面向Java、C/C++、Python等多种语言的客户端，非Java语言的客户端需要先访问ThriftServer，再通过其Java HBase客户端来请求HBase集群
@@ -117,4 +120,37 @@
     1. table.put(put)：最常见的单行数据写入API，在服务端先写WAL，然后写MemStore，一旦MemStore写满就flush到磁盘上。默认每次写入都需要执行一次RPC和磁盘持久化。因此写入吞吐量受限于磁盘带宽、网络带宽以及flush的速度。但是它能保证每次写入操作都持久化到磁盘，不会有任何数据丢失。最重要的是能保证put操作的原子性
     2. table.put(List\<Put> puts)：在客户端缓存put，再打包通过一次RPC发送到服务端，一次性写WAL并写MemStore。可以省去多次往返RPC及多次刷盘的开销，吞吐量大大提升，但此RPC操作一般耗时会长一些，因为一次写入了多行数据。如果put分布在多个Region内，则不能保证这一批put的原子性，因为HBase并不提供跨Region的多行事务，其中失败的put会经历若干次重试
     3. bulk load：通过HBase提供的工具直接将待写入数据生成HFile，直接加载到对应Region下的CF内，是一种完全离线的快速写入方式，是最快的批量写手段。load完HFile之后，CF内部会进行Compaction（异步且可限速，IO压力可控），对线上集群非常友好
-    
+
+## 第5章 RegionServer的核心模块
+- RegionServer组件实际上是一个综合体系，包含多个各司其职的核心模块：HLog、MemStore、HFile以及BlockCache
+### 5.1 RegionServer内部结构
+- 一个RegionServer中一个或多个HLog、一个BlockCache以及多个Region组成
+- HLog用来保证数据写入的可靠性
+- BlockCache可以将数据块缓存在内存中以提升数据读取性能
+- Region是HBase中数据表的一个数据分片，一个RegionServer上通常会负责多个Region的数据读写。一个Region由多个Store组成，Store数量与列簇数量一致，每个Store存放对应列簇的数据，每个Store包含一个MemStore和多个HFile
+### 5.2 HLog
+- HLog一般只用于RegionServer宕机丢失数据时进行恢复或HBase主从复制
+#### 5.2.1 HLog文件结构
+- 每个RegionServer拥有一个或多个HLog，每个HLog是多个Region共享的
+- HLog中，日志单元WALEntry表示一次行级更新的最小追加单元，由HLogKey和WALEdit两部分组成
+- HLogKey由table name, region name以及sequenceid等字段构成
+#### 5.2.2 HLog文件存储
+- HBase中所有数据都存储在HDFS的指定目录
+- HLog一般存储在/hbase/WALS和/hbase/oldWALs下，后者用于存储已过期的日志
+- WALS目录下一般有多个子目录，每个子目录对应一个RegionServer域名+端口号+时间戳
+#### 5.2.3 HLog生命周期
+- HLog生命周期的4个阶段：
+    1. HLog构建：HBase的任何写入操作都会先将记录追加写入到HLog文件中
+    2. HLog滚动：HBase后台启动一个线程，每隔一段时间进行日志滚动。会新建一个新的日志文件，接收新的日志数据，为了方便过期日志数据能够以文件的形式直接删除
+    3. HLog失效：写入数据一旦从MemStore中落盘，对应的日志数据就会失效。因此查看日志是否失效只需查看该日志对应的数据是否已经完成落盘。失效的日志文件会移动到oldWALs文件夹（此时还未被删除）
+    4. HLog删除：Master后台会启动线程每隔一段时间检查一次oldWALs下所有失效日志文件，确认是否可以删除并相应地执行删除操作。确认条件有两个：该HLog文件是否还在参与主从复制；该HLog文件是否已经在oldWALs目录中存在TTL时间（默认10分钟）
+### 5.3 MemStore
+- HBase中一张表会被水平切分成多个Region，每个Region负责自己区域的数据读写请求。水平切分意味着每个Region都有所有列簇数据，不同列簇数据由不同Store存储，每个Store都有一个MemStore和一系列HFile
+- 由于HDFS本身只允许顺序读写，不能更新，因此数据在落盘前生成HFile之前需要完成排序工作，MemStore就是KV数据排序的实际执行者
+- MemStore也作为一个缓存级的存储组件，缓存着最近写入的数据
+#### 5.3.1 MemStore内部结构
+- HBase使用了JDK自带的ConcurrentSkipListMap实现MemStore，其底层使用跳跃表来保证数据的有序性和各操作的O(logN)时间复杂度，并采用CAS原子性操作保证线程安全（避免锁开销）
+- MemStore由两个ConcurrentSkipListMap实现，写入操作会将数据写入Map A，当其数据量超过一定阈值后会创建一个Map B来接收用户新的请求，之前已经写满的Map A会执行异步flush操作落盘形成HFile
+#### 5.3.2 MemStore的GC问题
+- MemStore的工作模式会容易引起严重的内存碎片，因为一个RegionServer由多个Region构成，每个Region根据列簇的不同又包含多个MemStore，这些MemStore都是共享内存的。对于JVM而言所有MemStore的数据都是混合在一起写入Heap，此时如果某个Region上对应的所有MemStore执行落盘操作，则JVM会产生内存条带
+- 用于改善上述情况的方案：MSLAB内存管理方式、MemStore Chunk Pool。这两种方案日后可以深入研究下
