@@ -82,3 +82,39 @@
 - 一般意义上的Scan都无法通过布隆过滤器来提升扫描数据性能，因为key不确定，但在某些特定场景下Scan操作可以借其提升性能，如对于ROWCOL类型的过滤器，在Scan操作中明确指定需要扫某些列。
 - 在Scan过程中，碰到KV数据从一行换到新一行时，没法走ROWCOL布隆过滤器，因为新一行的Key值不确定，但是在同一行数据内切换列时可以进行优化，因为rowkey确定，同时column也已知
 
+## 第4章 HBase客户端
+### 4.1 HBase客户端实现
+- HBase提供了面向Java、C/C++、Python等多种语言的客户端，非Java语言的客户端需要先访问ThriftServer，再通过其Java HBase客户端来请求HBase集群
+#### 4.1.1 定位Meta表
+- HBase一张表的数据由多个Region构成，而这些Region分布在整个集群的RegionServer上
+- HBase系统内部设计了一张特殊的表——hbase:meta表，用于存放整个集群所有的Region信息
+- HBase保证hbase:meta表始终只有一个Region，以确保其多次操作的原子性（HBase本质上只支持Region级别的事务）
+- HBase客户端有一个叫做MetaCache的缓存，用于缓存业务rowkey所在的Region，这个Region可能有以下三种情况：
+    1. Region信息为空，说明MetaCache中没有这个rowkey所在Region的任何Cache，需要去hbase:meta表中做Reversed Scan。首次查找时还需要向ZooKeeper请求hbase:meta表所在的RegionServer
+    2. Region信息不为空，但是调用RPC请求对应RegionServer后发现Region并不在这个RegionServer上。说明MetaCache信息过期了，同样直接Reversed Scan后找到正确的Region并缓存
+    3. Region信息不为空且调用RPC请求到对应Region
+    Server后，发现是正确的RegionServer（绝大部分的请求都属于这种情况）
+#### 4.1.2 Scan的复杂之处
+- 用户每次执行scanner.next()，都会尝试去名为cache的队列中拿result。如果cache队列已经为空，则会发起一次RPC向服务端请求当前scanner的后续result数据。客户端收到result列表后，通过scanResultCache把这些results内的多个cell进行重组，最终组成用户需要的result放入到cache中。这个操作称为loadCache
+- result重组的原因是RegionServer为了避免被当前RPC请求耗尽资源，实现了多个维度的资源限制，比如鼻梁骨out、单次RPC响应最大字节数等，一旦某个维度资源达到阈值，就马上把当前拿到的cell返回给客户端，因此客户端拿到的result可能不是一行完整的数据，因此需要对result进行重组
+- Scan的几个重要概念：
+    - caching：每次loadCache操作最多放caching个result到cache队列中，可以以此控制每次loadCache向服务端请求的数据量，避免出现音效scanner.next()操作耗时极长的情况
+    - batch：用户拿到的result中最多含有一行数据中的batch个cell。如果某一行有5个cell，batch设置为2，那么用户会拿到3个result，它们包含的cell个数依次为2，2，1
+    - allowPartial：用户能容忍拿到一行部分cell的result。设置此属性会跳过result中的cell重组，直接把服务端收到的result返回给用户
+    - maxResultSize：loadCache时单次RPC操作最多拿到maxResultSize字节的结果集
+
+### 4.2 HBase客户端避坑指南
+- HBase中CAS接口的运行是Region级别串行执行的，其运行步骤为：
+    1. 服务端拿到Region的行锁，避免出现两个线程同时修改一行数据，从而破坏行级别原子性的情况
+    2. 等待该Region内的所有写入事务都已经成功提交并在mvcc上可见
+    3. 通过Get操作拿到需要check的行数据，进行条件检查。若条件不符合，则终止CAS
+    4. 将checkAndPut的put数据持久化
+    5. 释放第1步拿到的行锁
+- 在HBase2.x中对同一个Region内的不同行可以并行执行CAS，大大提高了Region内的CAS吞吐
+- PrefixFilter前缀过滤器的实现很简单粗暴，Scan会一条条扫描，发现前缀不为指定值就读下一行，直到找到第一个rowkey前缀为该值的行为止。使用时可以简单加一个startRow，这样在Scan时会首先寻址到这个startRow，然后从这个位置扫描数据。最简单的方式是直接将PrefixFilter展开为startRow和stopRow，直接扫描区间数据
+- PageFilter可以限定返回数据的行数以用于数据分页功能，但HBase里Filter状态全部都是Region内有效的，Scan一旦从一个Region切换到另一个Region，之前那个Filter的内部状态就无效了。这时用limit来实现更好
+- HBase提供3种常见的数据写入API：
+    1. table.put(put)：最常见的单行数据写入API，在服务端先写WAL，然后写MemStore，一旦MemStore写满就flush到磁盘上。默认每次写入都需要执行一次RPC和磁盘持久化。因此写入吞吐量受限于磁盘带宽、网络带宽以及flush的速度。但是它能保证每次写入操作都持久化到磁盘，不会有任何数据丢失。最重要的是能保证put操作的原子性
+    2. table.put(List\<Put> puts)：在客户端缓存put，再打包通过一次RPC发送到服务端，一次性写WAL并写MemStore。可以省去多次往返RPC及多次刷盘的开销，吞吐量大大提升，但此RPC操作一般耗时会长一些，因为一次写入了多行数据。如果put分布在多个Region内，则不能保证这一批put的原子性，因为HBase并不提供跨Region的多行事务，其中失败的put会经历若干次重试
+    3. bulk load：通过HBase提供的工具直接将待写入数据生成HFile，直接加载到对应Region下的CF内，是一种完全离线的快速写入方式，是最快的批量写手段。load完HFile之后，CF内部会进行Compaction（异步且可限速，IO压力可控），对线上集群非常友好
+    
