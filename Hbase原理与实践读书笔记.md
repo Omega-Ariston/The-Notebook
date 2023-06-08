@@ -255,3 +255,120 @@
     - BucketCache三种工作模式在内存逻辑组织形式以及缓存流程上都是相同的，但因三者对应的最终存储介质有所不同，IOEngine也会有所不同
     - heap和offheap都是使用内存作为存储介质，内存分配查询使用Java NIO ByteBuffer技术，前者使用ByteBuffer.allocate()，后者使用ByteBuffer.allocateDirect()
     - offheap模式需要将缓存先从操作系统拷贝到JVM heap，会更费时
+
+## 第6章 HBase读写流程
+### 6.1 HBase写入流程
+- HBase采用LSM树架构，适用于写多读少的应用场景
+- HBase服务端并没有提供update和delete接口，其对数据的更新、删除操作在服务器端也认为是写入操作，更新操作会写入一个最新版本数据，删除操作会写入一条标记为deleted的KV数据，因此流程与写入流程完全一致
+#### 6.1.1 写入流程的三个阶段
+- 从整体架构视角来看，写入流程可以概括为三个阶段：
+    1. 客户端处理阶段：客户端将用户的写入请求进行预处理，根据集群元数据定位到数据所在的RegionServer，将请求发送给对应的RegionServer
+    2. Region写入阶段：RegionServer接收到写入请求之后将数据解析出来，首先写入WAL，再写入对应Region列簇的MemStore
+    3. MemStore Flush阶段：当Region中MemStore容量超过一定阈值，系统会异步执行flush操作，将内存中的数据写入文件，形成HFile
+- 注意：用户写入请求在完成Region MemStore写入后会返回成功，因为后续的Flush是一个异步过程
+- 第1步的RPC请求会经过Protobuf序列化后发送给对应的RegionServer
+- 第2步在执行完检查（如Region是否只读、MemStore大小是否超过blockingMemStoreSize等）后会执行一系列核心操作，可以简单概括为获取行锁->更新Timestamp->为单次写入构建WALEdit->将WALEdit写入HLog->将数据写入MemStore->释放行锁->HLog同步到HDFS->结束写事务并对读请求可见
+#### 6.1.2 Region写入流程
+- HLog的持久化等级：
+    1. SKIP_WAL：只写缓存，不写HLog日志，性能佳，但数据有丢失风险
+    2. ASYNC_WAL：异步将数据写入HLog日志中
+    3. SYNC_WAL：同步将数据写入日志文件中，但只保证写入文件系统，不一定有落盘
+    4. FSYNC_WAL：同步将数据写入日志文件并强制落盘，可保证数据不会丢失，但性能较差
+    5. USER_DEFAULT：默认HBase使用SYNC_WAL等级
+- HLog的写入模型：
+    - HLog写入需要经过三个阶段：写本地缓存->写文件系统->写磁盘
+    - 三个阶段可以流水线工作，并使用生产者-消费者模型
+    - HBase使用LMAX Disruptor框架实现了无锁有界队列操作
+- 随机写入MemStore：
+    - KV写入MemStore并不会每次都随机在堆上创建一个内存对象，而是会通过MemStore-Local Allocation Buffer（MSLAB）机制预先申请一个大的（2M）Chunk内存，写入的KV会进行一次封装，顺序拷贝到这个Chunk中，以避免出现JVM内存碎片
+    - MemStore的3步写入流程：
+        1. 检查当前可用的Chunk是否写满，若满，则重新申请一个2M的Chunk
+        2. 将当前KV在内存中重新构建，在可用Chunk的指定offset处申请内存创建一个新的KV对象
+        3. 将新创建的KV对象写入ConcurrentSkipListMap中
+#### 6.1.3 MemStore Flush
+1. 触发条件
+    - MemStore级别限制：当Region中任意一个MemStore大小达到指定的上限（默认128M）
+    - Region级别限制：当Region中所有MemStore大小总和达到上限
+    - RegionServer级别限制：当RegionServer中MemStore的大小总和超过低水位阈值，RegionServer开始强制执行flush，从MemStore最大的Region开始依次flush，直到总MemStore大小下降到低水位阈值
+    - 当RegionServer中HLog数量达到上限，会选取最早的HLog对应的一个或多个Region进行flush
+    - HBase定期刷新MemStore：默认周期为1小时，有一定时间的随机延时
+    - 手动执行flush，通过shell命令flush 'tablename'或flush 'regionname'
+2. 执行流程
+    - HBase采用类似两阶段提交的方式将flush过程分为三个阶段，以减少flush过程对读写的影响：
+        1. prepare：遍历当前Region中所有MemStore，将当前数据集做一个snapshot，再新建一个数据集接收新的数据写入，此阶段需要添加updateLock对写请求阻塞，结束后释放（持锁很短）
+        2. flush：遍历所有MemStore，将上一阶段生成的snapshot持久化为临时文件统一放在.tmp目录下。因为涉及磁盘IO，这个过程比较慢
+        3. commit：遍历所有MemStore，将上一阶段生成的临时文件移到指定的ColumnFamily目录下，针对HFile生成对应的Storefile和Reader，把storefile添加到Store的storefiles列表中，再清空prepare阶段生成的snapshot
+3. 生成Hfile
+    - KV数据生成HFile，首先会构建Bloom Block以及Data Block，一旦写满一个Data Block就会将其落盘同时构造一个Leaf Index Entry，写入Leaf Index Block，直到Leaf Index Block写满落盘
+    - 每写入一个KV都会动态地去构建scanned block部分，等所有的KV都写入完成后再静态地构建non-scanned block、load-on-open以及trailer部分
+- 注意：大部分MemStore Flush操作不会对业务读写产生太大影响很大，比如定期刷新、手动执行、MemStore级别限制、HLog数量限制、Region级别限制，只会阻塞对应Region上的写请求，且阻塞时间较短。然而一旦触发RegionServer级别限制导致flush，会对用户请求产生较大的影响，会阻塞所有落在该RegionServer上的写入操作
+
+### 6.2 BulkLoad功能
+- Bulkload功能使用场景：用户数据位于HDFS中，业务需要定期将这部分海量数据导入HBase系统，以执行随机查询更新操作
+- Bulkload原理：首先使用MapReduce将待写入数据转换为HFile文件，再将这些HFile文件加载到在线集群，无需将写请求发给RegionServer处理
+#### 6.2.1 BulkLoad核心流程
+1. HFile生成阶段
+    - 这个阶段会运行一个MR任务，mapper需要自己实现，将HDFS文件中的数据读出来组装成一个复合KV，其中key是rowkey，value可以是KV对象、put对象或delete对象；reducer由HBase负责
+    - reducer的工作事项：
+        - 根据表信息配置一个全局有序的partitioner
+        - 将partitioner文件上传到HDFS集群并写入分布式缓存
+        - 将task个数设置为目标表Region的个数
+        - 设置输出key/value类，使其满足HFileOutputFormat格式要求
+        - 设置reducer执行相应排序
+2. HFile导入阶段
+    - 使用工具completebulkload将HFile加载到在线HBase集群
+    - completebuload的工作事项：
+        - 依次检查所有HFile文件，将每个文件映射到对应的Region
+        - 将HFile文件移动到对应Region所在的HDFS目录下
+        - 告知Region对应的RegionServer，加载HFile文件对外提供服务
+- Bulkload的数据源一定在HDFS上，如果需要通过Bulkload将MySQL中的数据导入HBase，则需要先将数据转换成HDFS上的文件
+- 当用户生成的HFile所在的HDFS集群和HBase所在的HDFS集群是同一个时，能保证HFile与目标Region落在同一个机器上（可由参数开关）。当不是同一个集群时，会无法保证locality，需要在跑完Bulkload后手动执行major compact
+- HBase1.3之前的版本中，Bulkload的数据不会被复制到peer集群，可能导致peer集群少数据。1.3之后可以通过参数开启Bulkload数据复制
+### 6.3 HBase读取流程
+- HBase读流程比写流程复杂得多，主要基于两方面原因：一是因为HBase一次范围查询可能涉及多个Region、多块缓存甚至多个数据存储文件；二是因为HBase中更新及删除操作实现简单，并没有更新和删除原有数据，真正的数据删除发生在major compact时。因此数据读取需要根据版本进行过滤，并对已经标记删除的数据进行过滤
+- HBase读取流程可分为四个步骤：
+    1. Client-Server读取交互逻辑
+    2. Server端Scan构架体系
+    3. 过滤淘汰不符合查询条件的HFile
+    4. 从HFile中读取待查找Key
+#### 6.3.1 Client-Server读取交互逻辑
+- HBase数据读取可分为get和scan两类，但其实可统一为scan一类，因为get其实就是scan了一行数据
+- Client-Server端的Scan操作并没有设计为一次RPC请求，因为扫描结果可能会很大，HBase会根据设置条件将一次大scan操作拆分为多个RPC请求，每个RPC请求称为一次next请求，只返回规定数量的结果，前面的章节中已有相应描述
+#### 6.3.2 Server端Scan框架体系
+- HBase中每个Region都是一个独立的存储引擎，客户端可以将每个子区间请求分别发送给对应的Region进行处理
+- RegionServer接收到客户端的get/scan请求后做了两件事情：首先构建scanner iterator体系；然后执行next函数获取KV，并对其进行条件过滤
+- Scanner的核心体系包括三层Scanner：Region Scanner、StoreScanner、MemStoreScanner+StoreFileScanner
+- 一个RegionScanner由多个StoreScanner构成，StoreScanner数量与列簇数量一致，并一一对应负责Store的数据查找
+- 一个StoreScanner由MemStoreScanner和StoreFileScanner构成，每个Store的数据由内存中的MemStore和磁盘上的StoreFile文件组成
+- 每个HFile都会由StoreScanner构造出一个StoreFileScanner，用于执行对应文件的检索，MemStore也一样
+- RegionScanner和StoreScanner并不负责实际查找操作，更多地承担组织调度的任务
+- KeyValueScanner会将该Store中所有StoreFileScanner和MemStoreScanner合并形成一个最小堆，并通过不断地pop来完成归并排序
+- 条件过滤会在KeyValueScanner执行next函数获取KV时进行
+#### 6.3.3 过滤淘汰不符合查询条件的HFile
+- 主要有有三种过滤手段：根据KeyRange、根据TimeRange、根据布隆过滤器
+#### 6.3.4 从HFile中读取待查找Key
+- 在一个HFile文件中seek待查找的key，可以分解为4步
+1. 根据HFile索引树定位目标Block
+    - 多级索引中只有根节点常驻内存，其余需要涉及IO查询，但Block有缓存机制可以提升性能
+2. BlockCache中检索目标Block
+    - 通过前文中提到的BackingMap
+3. HDFS文件中检索目标Block
+    - 读取HFile的命令会下发到HDFS
+    - NameNode做的两件事情：找到属于这个HFile的所有HDFSBlock列表，并确认数据在其中哪个Block上；找到Block后定位该Block存在于哪些DataNode上，选择一个最优的返回给客户端
+4. 从Block中读取待查找KV
+    - HFile Block由KV大小到大排序构成，但这些KV并不固定长度，因此只能遍历扫描查找
+### 6.4 深入理解Coprocessor
+- HBase的Coprocessor机制使用户可以将自己编写的代码运行在RegionServer上，大多数情况下用户用不上这个功能
+- Coprocessor分为两种：
+    1. Observer
+        - 类似于MySQL中的触发器，提供钩子使用户代码在特定事件发生之前或之后得到执行，比如在执行put或者get操作之前检查用户权限
+        - 当前HBase系统中提供4种Observer接口
+        1. RegionObserver：主要监听Region相关事件，比如get, put, scan, delete以及flush等
+        2. RegionServerObserver：主要监听RegionServer相关事件，比如RegionServer启动、关闭，或者执行Region合并等事件
+        3. WALObserver：主要监听WAL相关事件，比如WAL写入、滚动等
+        4. MasterObserver：主要监听Master相关事件，比如建表、删表以及修改表结构等
+    2. Endpoint
+        - 类似于MySQL中的存储过程，允许将用户代码下推到数据层执行
+        - 用户可以自定义一个客户端与RegionServer通信的RPC调用协议，通过RPC调用执行部署在服务器端的业务代码
+- Observer的钩子函数执行对用户透明，无需显式调用，而Endpoint的执行必须由用户显式触发调用
+- Coprocessor可以通过配置文件静态加载（需要重启集群）或动态加载（使用shell或HTableDescriptor中的相应函数）
