@@ -372,3 +372,80 @@
         - 用户可以自定义一个客户端与RegionServer通信的RPC调用协议，通过RPC调用执行部署在服务器端的业务代码
 - Observer的钩子函数执行对用户透明，无需显式调用，而Endpoint的执行必须由用户显式触发调用
 - Coprocessor可以通过配置文件静态加载（需要重启集群）或动态加载（使用shell或HTableDescriptor中的相应函数）
+
+## 第7章 Compaction实现
+- 一般基于LSM树体系架构的系统都会设计Compaction，比如LevelDB、RocksDB以及Cassandra等
+### 7.1 Compaction工作原理
+- Compaction是从一个Region的一个Store中选择部分HFile文件进行合并，先从这些待合并的数据文件中依次读出KV，再由小到大排序后写入一个新的文件，之后这个新文件会取代之前已合并的所有文件对外提供服务
+- HBase根据合并规模将Compaction分为两类：
+    1. Minor Compaction：选取部分小的、相邻的HFile，将它们合并成一个更大的HFile
+    2. Major Compaction：将一个Store中所有的HFile合并成一个HFile，这个过程中还会完全清理三类无意义数据：被删除的数据、TTL过期数据、版本号超过设定版本号的数据
+- 一般情况下Major Compaction持续时间比较长，消耗大量系统资源，对上层业务有比较大的影响，一般推荐关闭自动触发Major Compaction，在业务低峰期手动触发
+- HBase中Compaction的核心作用：
+    - 合并小文件，减少文件数，稳定随机读延迟
+    - 提高数据的本地化率
+    - 清除无效数据，减少数据存储量
+- Compaction合并小文件时会将落在远程Datanode上的数据读取出来重新写入大文件，合并后的大文件在当前DataNode节点上有一个副本，因此提高了数据的本地化率
+- Compaction过程中的明显副作用：将小文件的数据读出来需要IO，很多小文件数据跨网络传输需要带宽，读出来之后写入大文件，因为是三副本写入，所以需要网络及IO开销
+- Compaction的本质是使用短时间的IO消耗以及带宽消耗换取后续查询的低延迟
+#### 7.1.1 Compaction基本流程
+- Compaction会被交由一个独立的线程处理，该线程首先会从对应Store中选择合适的HFile文件进行合并（整个Compaction的核心）
+- 选择文件时最理想的情况是选取IO负载重、文件小的文件集，实际实现中HBase提供了多种文件选取算法，如RatioBasedCompactionPolicy、ExploringCompactionPolicy、和StripeCompactionPolicy等，用户也可以通过实现接口实现自己的Compaction策略
+- 选出文件后HBase会根据这些HFile文件总大小挑选对应的线程池处理，最后对这些文件执行具体的合并操作
+#### 7.1.2 Compaction触发时机
+- 最常见的有三种触发时机
+1. MemStore Flush：每次MemStore flush完都会检查当前Store中的文件数，一旦超过阈值就会触发Compaction。Compaction以Store为单位，而在flush触发条件下整个Region的所有Store都会执行compact检查，**所以一个Region有可能在短时间内执行多次Compaction**
+2. 后台线程周期性检查：RegionServer会在后台启动一个线程CompactionChecker，定期触发检查对应Store是否需要执行Compaction，该线程优先检查Store中总文件数是否大于阈值，一旦大于就触发Compaction；如果不满足，接着检查是否满足Major Compaction条件（当前Store中HFile最早更新时间是否早于某个值mcTime，一般是7天），此检查可以被禁用
+3. 手动触发：大多是为了执行Major Compaction，原因通常有三个：
+    1. 业务担心自动Major Compaction影响性能，选择低峰期手动触发
+    2. 用户执行完alter后希望立即生效
+    3. HBase管理员发现硬盘容量不够时，删除大量过期数据
+#### 7.1.3 待合并HFile集合选择策略
+- HBase早期版本的两种策略：RatioBased和Exploring
+- 两者都会首先对该Store中所有HFile逐一进行排查，排除当前正在执行Compaction的文件以及比这些文件更新的所有文件、某些过大的文件（默认Long.MAX_VALUE），以免产生大量IO消耗
+- 排除后留下来的文件称为候选文件，接下来HBase判断候选文件是否满足Major Compaction的条件，只要满足其中一条即可：
+    - 用户强制执行Major Compaction
+    - 长时间（上次执行的时间早于当前时间减hbase.hregion.majorcompaction值）没有进行Major Compaction且候选文件数小于指定值（默认10）
+    - Store中含有reference文件（region分裂产生的临时文件）
+- 如果满足Major Compaction条件，则文件选择直接结束，因为所有文件都要参加合并
+- 如果不满足Major Compaction条件，则为Minor Compaction，使用RatioBased或Exploring进行选择：
+1. RatioBasedCompactionPolicy
+    - 从老到新逐一扫描所有候选文件，满足其中一个条件则停止扫描
+    1. 当前文件大小<比当前文件新的所有文件大小总和*ratio，ratio为可变值，高峰期为1.2，非高峰期为5（非高峰期允许compact更大的文件），可以通过参数设置高峰期时间段
+    2. 当前所剩候选文件数<=指定值（默认3）
+    - 停止扫描后，待合并的文件就是当前扫描文件和比它更新的所有文件
+2. ExploringCompactionPolicy
+    - 与Ratio策略找到一个合适文件后就停止扫描不同，Exploring会记录所有合适的文件集合，并在这些文件集合中寻找最优解
+    - 最优解：待合并文件数最多或待合并文件数相同的情况下文件较小的
+#### 7.1.4 挑选合适的执行线程池
+- HBase中有一个专门的类CompactSplitThread负责接收Compaction请求和split请求，其内部构造了多个线程池：splits线程池负责处理所有split请求，largeCompactions用来处理大Compaction，smallCompaction负责处理小compaction
+- 上述设计的目的是能够将请求独立处理，提高系统的处理性能
+- 大Compaction并不是Major Compaction，小Compaction也并不是Minor Compaction，而是根据设置的阈值而定
+- largeCompactions和smallCompactions线程池默认都只有一个线程，可以通过参数进行调整
+
+#### 7.1.5 HFile文件合并执行
+- 合并流程主要分为以下几步：
+    1. 分别读出待合并HFile文件的KV，进行归并排序处理，写到./tmp目录下的临时文件中
+    2. 将临时文件移动到对应Store的数据目录
+    3. 将Compaction的输入文件路径和输出文件路径封装为KV写入HLog日志，并打上Compaction标记，最后强制执行sync
+    4. 将对应Store数据目录下的Compaction输入文件全部删除
+- 如果RegionServer在步骤2之前发生异常，本次Compaction会被认定为失败，下次可以重头来过，唯一的影响就是多了一份多余的数据
+- 如果RegionServer在步骤2和3之间发生异常，也仅会多一份冗余数据
+- 如果在步骤3和4之间发生异常，RegionServer在重新打开Region后首先会从HLog中看到标有Compaction的日志，因为此时输入文件和输出文件已经持久化到HDFS，只需要根据HLog移除Compaction输入文件即可
+
+#### 7.1.6 Compaction相关注意事项
+- Compaction执行阶段的读写吞吐量需要进行限制，以防止短时间大量系统资源消耗导致的用户业务读写延迟抖动
+1. Limit Compaction Speed
+    - 正常情况下用户需要设置吞吐量下限参数和上限参数
+    - 如果当前Store中File数量太多，且超过了blockingFileCount，此时所有写请求会被阻塞以等待Compaction的完成，此时上述限制会自动失效
+2. Compaction BandWith Limit
+    - 与前者思路基本一致，主要涉及两个参数
+    - compactBwLimit：一次Compaction的最大带宽使用量，实际使用带宽高于该值时，会强制其sleep一段时间
+    - numOfFilesDisableCompactLimit：写请求非常大的情况下，限制带宽使用会导致HFile规程，影响读请求响应延时，因此一旦Store中HFile数量超过该值，带宽限制就会失效
+
+### 7.2 Compaction高级策略
+- 优化Compaction的共性特征：
+    1. 减少参与Compaction的文件数，尽量不要合并大文件
+    2. 不要合并不需要合并的文件，如OpenTSDB应用场景下的老数据，基本不会被查询，合不合不影响性能
+    3. 小Region更有利于Compaction，因为大Region会生成大量文件，小Region只会生成少量文件，不会引起显著的IO放大
+- 这一部分还介绍了一些别出心裁的Compaction策略，值得日后回过头来研究
