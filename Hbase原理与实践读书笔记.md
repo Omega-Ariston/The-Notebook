@@ -7,7 +7,7 @@
     - row：行，一行数据包含一个唯一标识rowkey、多个column以及对应的值。表中所有row都按照rowkey的字典序从小到大排序
     - column：列，与关系型数据库中的列不同，column由column family（列簇）以及qualifier（列名）两部分组成，中间使用“：”相连。column family在表他去的时候需要指定，用户不能随意增减。而一个column family下的qualifier可以设置任意多个，因此列可以动态增加，理论上可以扩展到上百万列
     - timestamp：时间戳，每个cell在写入HBase的时候都会默认分配一个时间戳作为该cell的版本，同一个rowkey、column下可以有多个value，版本号越大表示数据越新
-    - cell：单元格，由五元组（row，column，timestamp，type，value）组成的结构，type表示put/delete这样的操作类型，鼻梁骨stamp表示版本。这个结构是以KV结构存储的，前四个元素组成的元组为key，value为value
+    - cell：单元格，由五元组（row，column，timestamp，type，value）组成的结构，type表示put/delete这样的操作类型，timestamp表示版本。这个结构是以KV结构存储的，前四个元素组成的元组为key，value为value
 - 总体而言，HBase引入了列簇的概念，列簇下的列可以动态扩展，时间戳则用以实现了数据的多版本支持
 
 #### 1.2.2 多维稀疏排序Map
@@ -99,7 +99,7 @@
     Server后，发现是正确的RegionServer（绝大部分的请求都属于这种情况）
 #### 4.1.2 Scan的复杂之处
 - 用户每次执行scanner.next()，都会尝试去名为cache的队列中拿result。如果cache队列已经为空，则会发起一次RPC向服务端请求当前scanner的后续result数据。客户端收到result列表后，通过scanResultCache把这些results内的多个cell进行重组，最终组成用户需要的result放入到cache中。这个操作称为loadCache
-- result重组的原因是RegionServer为了避免被当前RPC请求耗尽资源，实现了多个维度的资源限制，比如鼻梁骨out、单次RPC响应最大字节数等，一旦某个维度资源达到阈值，就马上把当前拿到的cell返回给客户端，因此客户端拿到的result可能不是一行完整的数据，因此需要对result进行重组
+- result重组的原因是RegionServer为了避免被当前RPC请求耗尽资源，实现了多个维度的资源限制，比如timeout、单次RPC响应最大字节数等，一旦某个维度资源达到阈值，就马上把当前拿到的cell返回给客户端，因此客户端拿到的result可能不是一行完整的数据，因此需要对result进行重组
 - Scan的几个重要概念：
     - caching：每次loadCache操作最多放caching个result到cache队列中，可以以此控制每次loadCache向服务端请求的数据量，避免出现音效scanner.next()操作耗时极长的情况
     - batch：用户拿到的result中最多含有一行数据中的batch个cell。如果某一行有5个cell，batch设置为2，那么用户会拿到3个result，它们包含的cell个数依次为2，2，1
@@ -154,3 +154,104 @@
 #### 5.3.2 MemStore的GC问题
 - MemStore的工作模式会容易引起严重的内存碎片，因为一个RegionServer由多个Region构成，每个Region根据列簇的不同又包含多个MemStore，这些MemStore都是共享内存的。对于JVM而言所有MemStore的数据都是混合在一起写入Heap，此时如果某个Region上对应的所有MemStore执行落盘操作，则JVM会产生内存条带
 - 用于改善上述情况的方案：MSLAB内存管理方式、MemStore Chunk Pool。这两种方案日后可以深入研究下
+### 5.4 HFile
+#### 5.4.1 HFile逻辑结构
+- HFile文件分为四个部分：
+1. Scanned Block：表示顺序扫描HFile时所有数据块交付被读取。这个部分包含Data Block, Leaf Index Block以及Bloom Block。Data Block存储用户的KV数据，Leaf Index Block存储索引树的叶子节点，Bloom Block存储布隆过滤器相关数据
+2. Non-scanned Block：表示在HFile顺序扫描的时候数据不会被读取，主要包括Meta Block和Intermediate Level Data Index Blocks两部分
+3. Load-on-open：这部分数据会在RegionServer打开HFile时直接加载到内存中，包括FileInfo、布隆过滤器MetaBlock、Root Data Index和Meta IndexBlock
+4. Trailer：主要记录了HFile的版本信息、其它各个部分的偏移值和寻址信息
+#### 5.4.2 HFile物理结构
+- HFile由不同类型的Block构成，虽然它们类型不同，但数据结构相同
+- Block大小可以在创建表列簇的时候指定，默认64K。通常来说，大号的Block有利于大规模顺序扫描，小号的Block更有利于随机查询
+- HFileBlock支持两种类型，一种含有checksum，一种不含
+- HFileBlock主要包含两个部分：BlockHeader和BlockData。其中Header主要存储Block相关元数据，Data用来存储具体数据
+- BlockHeader中最核心的字段是BlockType，表示该Block的类型
+- HBase中最核心的几种BlockType：
+    - Trailer Block：记录HFile基本信息，文件中各个部分的偏移量和寻址信息
+    - Meta Block：存储布隆过滤器相关元数据信息
+    - Data Block：存储用户KV信息
+    - Root Index：HFile索引树根索引
+    - Intermediate Level Index：HFile索引树中间层级索引
+    - Leaf Level Index：HFile索引树叶子索引
+    - Bloom Meta Block：存储Bloom相关元数据
+    - Bloom Block：存储Bloom相关数据
+#### 5.4.3 HFile的基础Block
+1. Trailer Block
+    - RegionServer在打开HFile时会加载并解析所有HFile的Trailer部分，再根据元数据内容进一步加载load-on-open部分的数据（需要知道对应的偏移量和数据大小）
+2. Data Block
+    - Data Block是HBase中文件读取的最小单元。主要存储用户的KV数据
+    - KV数据由4个部分组成：KeyLen、ValueLen、Key、Value，其中两个Len的长度是固定的
+#### 5.4.4 HFile中与布隆过滤器相关的Block
+- HBase会为每个HFile分配对应的位数组，用于存储hash函数的映射信息。
+- 当HFile文件越大，里面存储的KV值越多，位数组就会相应越大，不利于直接加载进内存。因此HFile V2将位数组进行了拆分，一部分连续的Key使用一个位数组。当根据Key进行查询时先定位到具体的位数组，再进行过滤
+- 文件结构上每个位数组对应一个Bloom Block（位于scanned block部分），为了方便Key定位到对应的位数组，HFile V2设计了相应的Bloom Index Block（位于load-on-open部分）
+#### 5.4.5 HFile中索引相关的Block
+- HFile V2中引入了多级索引，用于解决索引数据太大无法全部加载到内存中的问题
+- HFile中索引是树状结构，Root Index Block位于load-on-open部分，Intermediate Index Block位于Non-Scanned Block部分，Leaf Index Block位于scanned block部分
+- 刚开始Data Block数据量小时Root Index Block会直接指向Data Block。当Root Index Block大小超过阈值后索引会分裂为多级结构，变为两层：根->叶。数据量再变大则会变为三层：根->中间->叶
+1. Root Index Block
+    - IndexEntry表示具体的索引对象，每个索引对象由3个字段组成：Block Offset, BlockDataSize, BlockKey（索引指向Data Block中的第一个Key）
+    - 除此之外还有3个字段用来记录MidKey的相关信息，用于在对HFile进行split操作时，快速定位HFile的切分点位置
+2. NonRoot Index Block
+    - 在Root Index Block的3个核心字段基础上增加了内部索引Entry Offset字段，用于记录该Index Entry在Block中的相对偏移量，以实现Block内的二分查找。
+    - 所有非根节点索引块在内部定位一个Key的具体索引都不是通过遍历实现，而是使用二分查找，效率更高
+#### 5.4.7 HFile V3版本
+- V3版本新增了对cell标签功能的支持，为其它与安全相关的功能，如单元级ACL和单元级可见性提供了实现框架
+
+### 5.5 BlockCache
+- BlockCache是RegionServer级别的，一个RegionServer只有一个BlockCache，在其启动时就要完成初始化工作
+- 当前的三种BlockCache实现方案：LRUBlockCache、SlabCache、BucketCache。三种方案不同之处主要在于内存管理模式，其中LRU为JVM堆内方案，后两者则允许将部分数据存储在堆外
+#### 5.5.1 LRUBlockCache
+- HBase默认的BlockCache机制，用ConcurrentHashMap管理BlockKey到Block的映射关系，使用LRU淘汰算法将最近最少使用的Block置换出去
+1. 缓存分层策略
+    - HBase将整个BlockCache分为三个部分：single-access, multi-access和in-memory，分别占25%, 50%, 25%
+    - 在一次随机读中，一个Block从HDFS加载出来之后首先放入single-access区，后续如果有多次请求访问到这个Block，会将这个Block移到multi-access区，而in-memory区数据常驻内存，一般用来存储元数据这类访问频繁且量小的数据
+    - 建表的时候可以设置列簇属性IN_MEMORY=TRUE，该列簇的Block在从磁盘中加载出来后会直接放入in-memory区，但要注意这个区里一般都是系统元数据表，比如hbase:meta和hbase:namespace，所以放东西进去时要小心别把它们挤出去了，免得影响所有业务
+2. LRU淘汰算法实现
+    - 在每次cache block时系统将BlockKey和Block放入HashMap后都会检查BlockCache总量是否达到阈值，如果达到，则唤醒淘汰线程对Map中的Block进行淘汰
+    - 系统设置了3个MinMaxPriorityQueue，用于对3个缓存层分别进行LRU淘汰
+3. LRUBlockCache方案缺点
+    - 数据对应的内存对象在JVM中随着时间流逝会进入老年代，老年代的Block被淘汰后会变为内存垃圾，最终由CMS回收，带来大量内存碎片
+
+#### 5.5.2 SlabCache
+- 使用Java NIO DirectByteBuffer技术实现堆外内存存储，以解决上一个方案中的GC问题
+- 默认在系统初始化时分配两个缓冲区，分别占BlockCache大小的80%和20%
+- 两个缓冲区分别存储小于等于64K和小于等于128K的Block，所以Block太大时两个缓冲区都无法缓存
+- 当用户设置的Block大小大于128K时，SlabCache方案会失效，此时一般要搭配LRUCache做DoubleBlockCache。Block从HDFS加载出来后会在两个Cache中分别存储一份，读时首先在LRU中找，miss了再去Slab中找，如果命中，就将该Block放入LRU
+- SlabCache固定大小内存设置会导致实际内存使用率较低，且搭配LRU使用仍然会导致GC问题，HBase0.98版本后已不建议使用此方案
+
+#### 5.5.3 BucketCache
+- BucketCache有有一种工作模式：heap、offheap和file，分别使用JVM、DirectByteBuffer技术和类似SSD的存储介质来缓存Data Block
+- BucketCache会申请许多带有固定大小标签的Bucket，但与SlabCache不同，BucketCache会在初始化时申请14种不同大小的Bucket，当某一种Bucket空间不足时，系统会从其它Bucket空间借用内存，以避免内存使用率低的情况
+- 实际实现中，HBase将BucketCache和LRUCache搭配成为CombinedBlockCache，LRU用于存储Index Block和Bloom Block，而将Data Block存储在BucketCache中
+- 一次随机读需要先从LRUCache中查到对应的Index Block，再到BucketCache中查找对应Data Block
+- BucketCache极大降低了LRU的内存碎片问题，但使用堆外内存会存在拷贝内存的问题，一定程度上影响读写性能（2.0版本中得到了解决）
+1. BucketCache的内存组织形式
+    - HBase使用BucketAllocator类实现对Bucket的组织管理
+    - HBase会根据每个Bucket的size标签对Bucket进行分类，相同size的Bucket由同一个BucketSizeInfo管理。
+    - BucketSize总会比Block本身大1KB，因为Block本身并不严格固定大小，总会大那么一点
+    - HBase启动时就决定了size标签的分类，默认从4+1K到512+1K
+    - Bucket的size标签可以动态调整，比如空闲的Bucket可以转换为空间不足的Bucket，但会至少保留一个该size的Bucket
+2. BucketCache中Block缓存写入、读取流程
+    - BucketCache的5个模块：
+        1. RAMCache：是一个存储blockKey和Block对应关系的HashMap
+        2. WriteThread：整个Block写入的中心枢纽，负责异步将Block写入到内存空间
+        3. BucketAllocator：实现对Bucket的组织管理，为Block分配内存空间
+        4. IOEngine：具体的内存管理模块，将Block数据写入对应地址的内存空间
+        5. BackingMap：用于存储blockKey与对应物理内存偏移量的映射关系的HashMap，用于根据blockKey定位具体的Block
+    - Bucket缓存的写入流程：
+        1. 将Block写入RAMCache。实际实现中HBase设置了多个RAMCache，系统根据blockKey进行hash，根据hash结果将Block分配到对应RAMCache
+        2. WriteThread从RAMCache中取出所有Block。HBase会同时启动多个WriteThread并发地执行异步写入，每个WriteThread对应一个RAMCache
+        3. 每个WriteThread会遍历RAMCache中所有Block，分别调用bucketAllocator为这些Block分配内存空间
+        4. BucketAllocator选择与Block大小对应的Bucket进行存放并返回对应的物理地址偏移量offset
+        5. WriteThread将Block以及分配好的物理地址偏移量传给IOEngine模块，执行具体的内存写入操作
+        6. 写入成功后，将blockKey与对应物理内存偏移量的映射关系写入BackingMap中，用于后续查找
+    - Bucket缓存的读取流程：
+        1. 首先从RAMCache中查找，还没来得及写入Bucket的Block会在这
+        2. 如果在RAMCache中没有，再根据blockKey在BackingMap中找到对应的物理偏移地址量offset
+        3. 根据物理偏移地址offset直接从内存中查找对应的Block数据
+3. BucketCache工作模式
+    - BucketCache三种工作模式在内存逻辑组织形式以及缓存流程上都是相同的，但因三者对应的最终存储介质有所不同，IOEngine也会有所不同
+    - heap和offheap都是使用内存作为存储介质，内存分配查询使用Java NIO ByteBuffer技术，前者使用ByteBuffer.allocate()，后者使用ByteBuffer.allocateDirect()
+    - offheap模式需要将缓存先从操作系统拷贝到JVM heap，会更费时
