@@ -124,7 +124,7 @@
 ## 第5章 RegionServer的核心模块
 - RegionServer组件实际上是一个综合体系，包含多个各司其职的核心模块：HLog、MemStore、HFile以及BlockCache
 ### 5.1 RegionServer内部结构
-- 一个RegionServer中一个或多个HLog、一个BlockCache以及多个Region组成
+- 一个RegionServer由一个或多个HLog、一个BlockCache以及多个Region组成
 - HLog用来保证数据写入的可靠性
 - BlockCache可以将数据块缓存在内存中以提升数据读取性能
 - Region是HBase中数据表的一个数据分片，一个RegionServer上通常会负责多个Region的数据读写。一个Region由多个Store组成，Store数量与列簇数量一致，每个Store存放对应列簇的数据，每个Store包含一个MemStore和多个HFile
@@ -296,7 +296,7 @@
 2. 执行流程
     - HBase采用类似两阶段提交的方式将flush过程分为三个阶段，以减少flush过程对读写的影响：
         1. prepare：遍历当前Region中所有MemStore，将当前数据集做一个snapshot，再新建一个数据集接收新的数据写入，此阶段需要添加updateLock对写请求阻塞，结束后释放（持锁很短）
-        2. flush：遍历所有MemStore，将上一阶段生成的snapshot持久化为临时文件统一放在.tmp目录下。因为涉及磁盘IO，这个过程比较慢
+        2. flush：遍历所有MemStore，将上一阶段生成的snapshot持久化为临时文件统一放在./tmp目录下。因为涉及磁盘IO，这个过程比较慢
         3. commit：遍历所有MemStore，将上一阶段生成的临时文件移到指定的ColumnFamily目录下，针对HFile生成对应的Storefile和Reader，把storefile添加到Store的storefiles列表中，再清空prepare阶段生成的snapshot
 3. 生成Hfile
     - KV数据生成HFile，首先会构建Bloom Block以及Data Block，一旦写满一个Data Block就会将其落盘同时构造一个Leaf Index Entry，写入Leaf Index Block，直到Leaf Index Block写满落盘
@@ -449,3 +449,116 @@
     2. 不要合并不需要合并的文件，如OpenTSDB应用场景下的老数据，基本不会被查询，合不合不影响性能
     3. 小Region更有利于Compaction，因为大Region会生成大量文件，小Region只会生成少量文件，不会引起显著的IO放大
 - 这一部分还介绍了一些别出心裁的Compaction策略，值得日后回过头来研究
+
+## 第8章 负载均衡实现
+### 8.1 Region迁移
+- 实际执行分片迁移的两个步骤：先根据负载均衡策略制定分片迁移计划，再根据迁移计划执行分片的实际迁移
+1. Region迁移的流程
+    - Region迁移虽然轻量级，但实现逻辑比较复杂，主要体现在两个方面：迁移过程中涉及多种状态的改变；迁移过程中涉及Master、ZK以及RegionServer等多个组件的相互协调
+    - 实际过程中，Region迁移分为两个阶段：unassign阶段和assign阶段
+    - unassign阶段：表示Region从源RegionServer上下线
+        1. Master生成事件M_ZK_REGION_CLOSING并更新到ZK组件，同时将本地内存中该Region的状态修改为PENDING_CLOSE
+        2. Master通过RPC发送close命令给拥有该Region的RegionServer，令其关闭该Region
+        3. RegionServer接收到Master发送过来的命令后，生成一个RS_ZK_REGION_CLOSING事件，更新到ZK
+        4. Master监听到ZK节点变动后，更新内存中Region的状态为CLOSING
+        5. RegionServer执行Region关闭操作。如果该Region正在执行flush或者Compaction，等待操作完成；否则将该Region下的所有MemStore强制flush，然后关闭Region相关的服务
+        6. 关闭完成后生成事件RS_ZK_REGION_CLOSED，更新到ZK。Master监听到ZK节点变动后，更新该Region状态为CLOSED
+    - assign阶段：表示Region在目标RegionServer上上线
+        1. Master生成事件M_ZK_REGION_OFFLINE并更新到ZK组件，同时将本地内存中该Region的状态修改为PENDING_OPEN
+        2. Master通过RPC发送open命令给拥有该Region的RegionServer，令其打开该Region
+        3. RegionServer接收到Master发送过来的命令后，生成一个RS_ZK_REGION_OPENING事件，更新到ZK
+        4. Master监听到ZK节点变动后，更新内存中Region的状态为OPENING
+        5. RegionServer执行Region打开操作，初始化相应的服务
+        6. 打开完成后生成事件RS_ZK_REGION_OPENED，更新到ZK，Master监听到ZK节点变动后，更新该Region的状态为OPEN
+    - 总体来看，整个过程涉及Master、RegionServer和ZooKeeper三个组件，它们的主要职责如下：
+        - Master负责维护Region在整个操作过程中的状态变化，起到枢纽的作用
+        - RegionServer负责接收Master的指令执行具体的unassign/assign操作，实际上就是关闭Region或者打开Region操作
+        - ZooKeeper负责存储操作过程中的事件。ZooKeeper有一个路径为/hbase/region-in-transition的节点，一旦Region发生unassign操作，就会在这个节点下生成一个子节点，内容是“事件”经过序列化的字符串，并且Master会在这个子节点上监听
+2. Region In Transition
+    - 迁移操作为什么需要设置这些状态？因为unassign和assign都是由多个子操作组成，涉及多个组件的协调合作，需要记录状态用以跟踪进度，以便于在异常发生后根据进度继续执行
+    - 管理状态的方式：
+    1. meta表：只存储Region所在的RegionServer
+    2. Master内存：存储整个集群所有的Region信息，状态变更由RegionServer通知到ZK再通知到Master，所以会有信息滞后。在HBase Master WebUI上看到的Region状态均来自于此
+    3. ZooKeeper的region-in-transition节点：存储临时性状态转移信息，作为Master和RegionServer间反馈Region状态的通道
+    - 当这三个状态不一致时，就会出现Region In Transition（RIT）现象
+    - Region在迁移的过程中必然会出现短暂的RIT状态，无需任何人工干预操作
+### 8.2 Region合并
+- 用得不多，一个典型的应用场景：在某些业务中本来接收写入的Region在之后的很长时间都不再接收任何写入，而且Region上的数据因为TTL过期被删除，这种场景下的Region实际上没有任何存在意义，称为空闲Region。空闲Region过多会导致集群管理运维成本增加，可以使用在线合并功能将这些Region与相邻Region合并
+- 从原理上看，Region合并的主要流程如下：
+    1. 客户端发送merge请求给Master
+    2. Master将待合并的所有Region都move到同一个RegionServer上
+    3. Master发送merge请求给该RegionServer
+    4. RegionServer启动一个本地事务执行merge操作
+    5. merge操作将待合并的两个Region下线，并将两个Region的文件进行合并
+    6. 将这两个Region从hbase:meta中删除，并将新生成的Region添加到hbase:meta中
+    7. 将新生成的Region上线
+- HBase使用merge_region命令进行Region合并，其是一个异步操作，需要用户在一段时间后手动检测合并是否成功
+- 默认情况下merge_region命令只能合并两个相邻的Region，但也能使用参数来强制合并不相邻Region，但该参数风险较大，不推荐生产线上使用
+### 8.3 Region分裂
+- HBase最核心的功能之一，是实现分布式可扩展性的基础
+1. Region分裂触发策略（总共6种，常见的3种如下）
+    - ConstantSizeRegionSplitPolicy
+        - 0.94版本之前默认分裂策略
+        - 一个Region中最大Store大小超过设置阈值后会触发分裂
+        - 实现简单但弊端在于对于大表和小表没有明显的区分：阈值设置得大对大表比较友好，但小表可能就不会触发分裂导致只有一个Region；设置得小对小表友好，但大表会分裂出一堆Region，对集群管理、资源使用都有害
+    - IncreasingToUpperBoundRegionSplitPolicy
+        - 0.94-2.0版本默认分裂策略
+        - 总体与前一任策略思路相同，使用阈值触发分裂，但阈值会在一定条件下不断调整
+        - 调整后的阈值大小与Region所属表在当前RegionServer上的Region个数有关
+        - 阈值等于#regions * #regions * #regions * flush size *２
+        - 阈值不会无限增大，用户可以设置最大值
+        - 能自适应大表和小表，但在大集群场景下，很多小表会产生大量小Region，分散在整个集群中
+    - SteppingSplitPolicy
+        - 2.0版本默认分裂策略
+        - 相比前一任简单了一些
+        - 阈值大小和待分裂Region所属表在当前RegionServer上的Region个数有关
+        - 如果Region个数为1，阈值则为flush size * 2，否则为最大值
+        - 小表不会再产生大量的小Region了
+    - 一般情况下用默认分裂策略就行
+2. Region分裂准备工作——寻找分裂点
+- HBase对于分裂点的定义：整个Region中最大Store中的最大文件中最中心的一个Block的首个rowkey。如果定位到的rowkey是整个文件的首个rowkey或最后一个rowkey，则认为没有分裂点
+- 没有分裂点的场景：待分裂Region只有一个Block时
+3. Region核心分裂流程
+- HBase将Region分裂包装成一个事务，以保证分裂的原子性，整个事务分为三个阶段：
+    1. prepare阶段
+        - 在内存中初始化两个子Region，具体为两个HRegionInfo对象
+        - 同时生成一个transaction journal，用于记录分裂的进展
+    2. execute阶段
+        1. RegionServer将ZK节点/region-in-transition中该Region的状态更新为SPLITTING
+        2. Master通过watch同一个ZK节点检测到Region状态改变，并修改内存中Region状态（在Master页面RIT模块中可见）
+        3. 在父存储目录下新建临时文件夹.split，保存split后的daughter region信息
+        4. 关闭父Region。父Region关闭数据写入并触发flush操作，将写入Region的数据全部持久化磁盘。此时短期内客户端落在父Region上的请求都会抛出异常NotServingRegionException
+        5. 在.split文件夹下新建两个子文件夹，daughter A和B，并在文件夹中生成reference文件，分别指向父Region中的对应文件（**最核心的一步**）
+            - reference文件的文件名可以指出父Region中的HFile文件
+            - reference文件是一个引用文件（并非Linux链接文件），文件内容并非用户数据，而是由两部分构成：分裂点splitkey和一个boolean类型变量（用于表示该reference文件引用的是父文件的上半部分true还是下半部分false）
+        6. 父Region分裂为两个子Region后，将daughter A和B拷贝到HBase根目录下，形成两个新Region
+        7. 父Region通知修改hbase:meta后下线，不再提供服务。下线后父Region的meta信息不会马上删除，而是将split列、offline列标记为true，并记录两个子Region
+        8. 开启daughter A和B两个子Region，通知修改meta表，正式对外提供服务
+    3. rollback阶段
+        - 整个分裂过程分为很多个子阶段，JournalEntryType会记录各个子阶段，并给回滚程序提供清理对应垃圾数据的依据
+4. Region分裂原子性保证
+    - HBase使用状态机的方式保存分裂过程中的每个子步骤状态，但它们都只存储在内存中，如果出现RegionServer宕机的情况，可能出现RIT状态，需要使用HBCK工具具体查看并分析解决方案
+    - 2.0版本后会实现新的分布式事务框架Procedure V2，使用类似HLog的日志文件存储这种单机事务的中间状态（已经实现了吗？）
+5. Region分裂对其它模块的影响
+    - 分裂过程并不涉及数据移动，子Region的文件实际没有用户数据，仅存储一些元数据信息，如分裂点rowkey等
+    - 通过reference文件查找数据的流程
+        1. 根据reference文件名（父Region名+HFile文件名）定位到真实数据所在文件路径
+        2. 根据reference文件内容中记录的两个重要字段确定实际扫描范围
+    - 父Region的数据迁移到子Region目录的时间
+        - 迁移发生在子Region执行Major Compaction时，其本质便是一次数据迁移
+        - 子Region在做Major Compaction时会将父目录中属于该Region的数据读出来并写入自己的目录数据文件中
+    - 父Region被删除的时间
+        - Master会启动一个线程定期遍历检查所有处于splitting状态的父Region，确认其是否可以被清理
+        - 检查过程分为两步：先去meta表中读出所有split列为true的Region，并加载出分裂后的两个子Region；检查两个子Region中是否还存在引用文件，如果不存在就删掉父Region
+### 8.4 HBase的负载均衡应用
+- 实际生产环境中，负载均衡机制最重要的应用场景是系统扩容，其一般分为两个步骤：增加节点并让系统感知到节点加入；将系统中已有节点负载迁移到新加入节点上
+- 负载均衡策略需要明确系统负载是什么，通过哪些元素刻画，以及明确当前负载，并在需要的时候制订负载迁移计划
+- 目前官方支持两种负载均衡策略：
+    1. SimpleLoadBalancer策略
+        - 能保证每个RegionServer的Region个数基本相等（所有RegionServer上的Region个数在[floor(average), ceil(average)之间]，average=#Region/#RegionServer
+        - 此策略中负载就是Region个数，集群负载迁移计划就是Region从个数较多的RegionServer上迁移到个数较少的RegionServer上
+        - 此策略简单易懂，但没考虑RegionServer上的读写QPS、数据量大小等因素，实际可能会忽略一些热点数据
+    2. StochasticLoadBalancer策略
+        - 对于负载的定义更复杂，是由多种独立负载加权计算的复合值，包括：Region个数、Region负载、读请求数、写请求数、Storefile大小、MemStore大小、数据本地率、移动代价
+        - 上述各独立负载会经过加权计算得到一个代价值，系统使用这个代价值来评估当前Region分布是否均衡，越均衡代价值越低。HBase通过不断随机挑选迭代来找到一组Region迁移计划，使得代价值最小
+
