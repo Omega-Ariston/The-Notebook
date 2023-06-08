@@ -562,3 +562,26 @@
         - 对于负载的定义更复杂，是由多种独立负载加权计算的复合值，包括：Region个数、Region负载、读请求数、写请求数、Storefile大小、MemStore大小、数据本地率、移动代价
         - 上述各独立负载会经过加权计算得到一个代价值，系统使用这个代价值来评估当前Region分布是否均衡，越均衡代价值越低。HBase通过不断随机挑选迭代来找到一组Region迁移计划，使得代价值最小
 
+## 第9章 宕机恢复原理
+### 9.1 HBase常见故障分析
+- HBase系统中主要有两类服务进程：Master进程和RegionServer进程，前者主要负责集群管理调度，一般没什么压力，后者主要负责用户的读写服务，进程中包含很多缓存组件以及与HDFS交互的组件，往往有很大压力，容易出故障
+- 一些常见的可能导致RegionServer宕机的异常：Full GC、HDFS异常、物理机器宕机、HBase BUG
+### 9.2 HBase故障恢复基本原理
+1. Master故障恢复原理
+    - HBase采用热备方式来实现Master高可用，通常要求集群中至少启动两个Master进程，进程启动后会到ZK上的Master节点进行注册，注册成功后会成为Active Master，未成功的其它进程会在Backup-Masters节点进行注册，并持续关注Active Master的情况，一旦Active Master宕机，它们会立刻得到通知并再次竞争注册Master节点
+    - Active Master会接管整个系统的元数据管理任务，以及响应用户的各种管理命令
+2. RegionServer故障恢复原理
+    - RegionServer发生宕机时HBase会马上检测到，并将宕机RegionServer上的所有Region重新分配到集群中其他正常的RegionServer上，再通过HLog进行丢失数据恢复，完成之后就可以对外提供服务，无需人工干预，流程如下：
+    1. Master检测宕机是通过ZK实现的，RegionServer会周期性向ZK发送心跳，一旦心跳停止发送并超时，则ZK认为该RegionServer宕机离线
+    2. RegionServer宕机后MemStore中还未持久到文件的这部分数据必然会丢。HLog中所有Region的数据都混合存储在同一个文件中，为了使数据能够按照Region进行组织回放，需要将HLog日志进行切分再合并，将同一个Region的数据最终合并在一起
+    3. Master重新分配宕机RegionServer上的Region，但还未上线
+    4. 回放HLog日志补救数据
+    5. 恢复完成，继续对外提供服务
+### 9.3 HBase故障恢复流程
+- 对于HLog中不同Region的数据切分，早期HBase的策略是整个切分过程都由Master来完成，有很大效率问题。后来使用了分布式日志切分（DLS）实现，借助了Master和所有RegionServer的计算能力进行日志切分：Master作为协调者，RegionServer作为工作者，将HLog切分并写入hdfs中
+- 分布式日志回放（DLR）则在分布式日志切分的基础上做了两点改动：先重新分配Region再切分回放HLog，且Region重新分配打开后状态设置为Recovering，此状态下的Region可以对外提供写服务，但不能提供读服务，且不能split和merge等
+- DLR与DLS的区别在于DLR在将HLog分解为Region-Buffer后并没有写入小文件，而是直接执行回放以减小小文件的读写IO消耗，解决DLS的短板
+### 9.4 HBase故障时间优化
+- HBase故障恢复的4个核心流程：故障检测、切分HLog、Assign Region、回放Region的HLog日志，其中切分HLog的耗时最长
+- 早期设计中针对每个Region都会打开一个writer做数据的追加写入，但这种设计会导致HDFS集群上DataNode的Xceiver线程消耗过大（总数有限，消耗数为writer数*副本数），达到上限后会不断报错导致HBase停止服务
+- 小米HBase团队提出的解决方法是通过writer池控制writer数量（HBase1.4.1及以上版本）
