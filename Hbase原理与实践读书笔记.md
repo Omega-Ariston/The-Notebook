@@ -585,3 +585,53 @@
 - HBase故障恢复的4个核心流程：故障检测、切分HLog、Assign Region、回放Region的HLog日志，其中切分HLog的耗时最长
 - 早期设计中针对每个Region都会打开一个writer做数据的追加写入，但这种设计会导致HDFS集群上DataNode的Xceiver线程消耗过大（总数有限，消耗数为writer数*副本数），达到上限后会不断报错导致HBase停止服务
 - 小米HBase团队提出的解决方法是通过writer池控制writer数量（HBase1.4.1及以上版本）
+
+## 第10章 复制
+- HBase默认使用异步复制，RegionServer的后台线程会不断推送HLog的Entry到Peer集群，但HBase1.X无法保证推送顺序一致，可能造成主从集群数据不一致，且备份机房数据肯定会滞后，无法满足热备需求，为了解决这两个问题HBase2.X实现了串行和同步复制
+## 10.1 复制场景及原理
+- Peer是指一条从主集群到备份集群的复制链路
+- HBase2.x的复制管理流程：
+    1. Client将创建Peer的请求发送到Master
+    2. Master内实现了一个名为Procedure的框架，它会将管理操作拆分成N个步骤，每执行完一个步骤都会把状态信息持久化到HDFS，以供异常恢复后继续执行。对于Peer创建来说，Procedure会创建相关的ZNode，并将复制相关的元数据保存在ZK中
+    3. Master的Procedure会向每一个RegionServer发送创建Peer的请求，直到所有RegionServer都成功创建Peer；否则会重试
+    4. Master返回给HBase客户端
+- HBase2.x的复制流程：
+    1. 创建Peer时，每一个RegionServer会创建一个ReplicationSource线程，把当前正在写入的HLog保存在复制队列中，然后在RegionServer上注册一个Listener，用于监听HLog Roll操作，一旦操作发生，ReplicationSource会把这个HLog分到对应的walGroup-Queue中，同时把HLog文件名持久化到ZK上
+    2. 每个walGroup-Queue后端辰一个ReplicationSourceWALReader线程，会不断地从Queue中取出一个HLog，然后把其中的Entry逐个读出来，放到一个名为entryBatchQueue的队列中
+    3. entryBatchQueue队列后端有一个名为ReplicationSourceShipper的线程，不断地从Queue中取出Log Entry，交给Peer的ReplicationEndpoint。后者将这些Entry打包成一个replicateWALEntry操作，通过RPC发送到Peer集群的某个RegionServer上。对应Peer集群的RegionServer将replicateWALEntry解析成若干个Batch操作，并调用batch接口执行。RPC调用成功后，ReplicationSourceShipper会更新最近一次成功复制的HLog Position到ZK
+## 10.2 串行复制
+- 非串行复制导致的问题：当Region从一个RS移到另外一个RS的过程中，Region的数据会分散在两个RS的HLog上，而两个RS完全独立地推送各自的HLog，从而导致同一个Region的数据并行写入Peer集群
+- 一个简单的解决思路：把Region的数据按照Region移动发生的时间点t0分成两段，小于t0的数据在RS0的HLog上，大于t0的数据在RS1的HLog上。推送时先让RS0推，等它推完再让RS1推，以保证顺序一致性
+- 目前社区版本的实现思路大概如同上述，其中有三个重要概念：
+    1. Barrier：与上述思路的t0相似，每次Region重新assign到新RS时，新RS打开Region前能读到的最大SequenceId（对应此Region在HLog中的最近一次写入数据分配的SequenceId）。因此每Open一次Region，就会产生一个新Barrier，N个Barrier将Region的SequenceId数轴划分为N+1个区间
+    2. LastPushedSequenceId：该Region最近一次成功推送到Peer集群的HLog的SequenceId，每次成功推送一个Entry到Peer集群后，都需要将此值更新
+    3. PendingSequenceId：该Region当前读到的HLog的SequenceId
+- HBase只需对每个Region维护一个Barrier列表和LastPushedSequenceId即可按照规则确保数据区域推送的顺序一致
+- 位置靠后的RS会检查LastPushedSequenceId的值来判断当前的进度，如果没轮到自己就休眠一会之后再来检查
+## 10.3 同步复制
+- 设计思路：RS在收到写入请求后，除了在主集群上写HLog日志，还会在备份集群上写一份RemoteWAL日志，只有等HLog+RemoteWAL+MemStore写入成功后才会返回成功给客户端。除此之外，主备集群间还会开启异步复制链路（双保险？），当主集群的HLog通过异步复制推送到备份集群后其对应的RemoteWAL才会被清理。因此RemoteWAL可以认为是成功写入主集群但未被异步复制成功推送到备份集群的数据
+1. 集群复制的几种状态
+    - Active：该状态下的集群将在远程集群上写RemoteWAL日志，同时拒绝接收来自其他集群的复制数据。一般情况下，同步复制中的主集群会牌Active状态
+    - Downgrade Active(DA)：该状态下的集群将跳过写RemoteWAL流程，同时拒绝接收来自其他集群的复制数据。一般情况下，同步复制中的主集群因备份集群不可用卡住后会被降级为DA状态，以满足业务的实时读写
+    - Standby(S)：该状态下的集群不容许Peer内的表被客户端读写，只接收来自其他集群的复制数据，并确保不会将本集群中Peer内的表数据复制到其他集群上。一般情况下，同步复制中的备份集群会处于Standby状态
+    - None(N)：表示没有开启同步复制
+2. 建立同步复制
+    - 建立同步复制可分为三步：
+    1. 在主备集群分别建立一个指向对方的同步复制Peer，此时两个集群的状态默认为DA
+    2. 通过transit_peer_sync_replication_state命令将备份集群状态从DA切换成S
+    3. 将主集群状态从DA切换成A
+3. 备集群故障处理流程
+    1. 先将主集群从Active降级到DA，以免因为写RemoteWAL失败而导致写入请求失败，后续业务的写入会通过异步复制来完成备份
+    2. 确保备份集群恢复后，将备份集群状态切换为S，失败期间的数据由异步复制完成同步
+    3. 把主集群状态从DA切换回A
+4. 主集群故障处理流程
+    1. 将备份集群状态从S切换成DA，不再接收来自主集群的数据，此时以备份集群数据为准。这个过程中备份集群会先回放RemoteWAL日志以保证主备数据一致，之后再让业务方把读写流量切换过来
+    2. 主集群恢复后，还会以为自己的状态是A，但此时读写流量都在备集群上
+    3. 在建立同步复制过程中，备份集群建立了一个向主集群复制的Peer，由于A状态下会拒绝来自其它集群的复制请求，因此这个Peer会阻塞客户端写向备集群的HLog。此时把主集群切换为S即可，等备集群Peer将数据同步回主集群后，数据会最终一致
+    4. 把备集群状态从DA切换为A，完成主备切换
+- 同步复制和异步复制对比
+    - 同步复制需要占用2倍的带宽和存储空间，用于RemoteWAL的写入
+    - 同步复制总能保证数据的最终一致，而异步不能
+    - 若主集群故障，异步复制下服务不可用，同步复制下只需花少许时间重放RemoteWAL便可恢复服务
+    - 同步复制的运维操作更复杂，需要理解集群状态并手动切换主备集群
+    - 同步复制下的写入性能会稍低13%左右
