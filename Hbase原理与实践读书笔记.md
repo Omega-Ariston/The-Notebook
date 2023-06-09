@@ -454,22 +454,22 @@
 ### 8.1 Region迁移
 - 实际执行分片迁移的两个步骤：先根据负载均衡策略制定分片迁移计划，再根据迁移计划执行分片的实际迁移
 1. Region迁移的流程
-    - Region迁移虽然轻量级，但实现逻辑比较复杂，主要体现在两个方面：迁移过程中涉及多种状态的改变；迁移过程中涉及Master、ZK以及RegionServer等多个组件的相互协调
+    - Region迁移虽然轻量级，但实现逻辑比较复杂，主要体现在两个方面：迁移过程中涉及多种状态的改变；迁移过程中涉及Master、ZooKeeper以及RegionServer等多个组件的相互协调
     - 实际过程中，Region迁移分为两个阶段：unassign阶段和assign阶段
     - unassign阶段：表示Region从源RegionServer上下线
-        1. Master生成事件M_ZK_REGION_CLOSING并更新到ZK组件，同时将本地内存中该Region的状态修改为PENDING_CLOSE
+        1. Master生成事件M_ZK_REGION_CLOSING并更新到ZooKeeper组件，同时将本地内存中该Region的状态修改为PENDING_CLOSE
         2. Master通过RPC发送close命令给拥有该Region的RegionServer，令其关闭该Region
-        3. RegionServer接收到Master发送过来的命令后，生成一个RS_ZK_REGION_CLOSING事件，更新到ZK
-        4. Master监听到ZK节点变动后，更新内存中Region的状态为CLOSING
+        3. RegionServer接收到Master发送过来的命令后，生成一个RS_ZK_REGION_CLOSING事件，更新到ZooKeeper
+        4. Master监听到ZooKeeper节点变动后，更新内存中Region的状态为CLOSING
         5. RegionServer执行Region关闭操作。如果该Region正在执行flush或者Compaction，等待操作完成；否则将该Region下的所有MemStore强制flush，然后关闭Region相关的服务
-        6. 关闭完成后生成事件RS_ZK_REGION_CLOSED，更新到ZK。Master监听到ZK节点变动后，更新该Region状态为CLOSED
+        6. 关闭完成后生成事件RS_ZK_REGION_CLOSED，更新到ZooKeeper。Master监听到ZooKeeper节点变动后，更新该Region状态为CLOSED
     - assign阶段：表示Region在目标RegionServer上上线
-        1. Master生成事件M_ZK_REGION_OFFLINE并更新到ZK组件，同时将本地内存中该Region的状态修改为PENDING_OPEN
+        1. Master生成事件M_ZK_REGION_OFFLINE并更新到ZooKeeper组件，同时将本地内存中该Region的状态修改为PENDING_OPEN
         2. Master通过RPC发送open命令给拥有该Region的RegionServer，令其打开该Region
-        3. RegionServer接收到Master发送过来的命令后，生成一个RS_ZK_REGION_OPENING事件，更新到ZK
-        4. Master监听到ZK节点变动后，更新内存中Region的状态为OPENING
+        3. RegionServer接收到Master发送过来的命令后，生成一个RS_ZK_REGION_OPENING事件，更新到ZooKeeper
+        4. Master监听到ZooKeeper节点变动后，更新内存中Region的状态为OPENING
         5. RegionServer执行Region打开操作，初始化相应的服务
-        6. 打开完成后生成事件RS_ZK_REGION_OPENED，更新到ZK，Master监听到ZK节点变动后，更新该Region的状态为OPEN
+        6. 打开完成后生成事件RS_ZK_REGION_OPENED，更新到ZooKeeper，Master监听到ZooKeeper节点变动后，更新该Region的状态为OPEN
     - 总体来看，整个过程涉及Master、RegionServer和ZooKeeper三个组件，它们的主要职责如下：
         - Master负责维护Region在整个操作过程中的状态变化，起到枢纽的作用
         - RegionServer负责接收Master的指令执行具体的unassign/assign操作，实际上就是关闭Region或者打开Region操作
@@ -478,7 +478,7 @@
     - 迁移操作为什么需要设置这些状态？因为unassign和assign都是由多个子操作组成，涉及多个组件的协调合作，需要记录状态用以跟踪进度，以便于在异常发生后根据进度继续执行
     - 管理状态的方式：
     1. meta表：只存储Region所在的RegionServer
-    2. Master内存：存储整个集群所有的Region信息，状态变更由RegionServer通知到ZK再通知到Master，所以会有信息滞后。在HBase Master WebUI上看到的Region状态均来自于此
+    2. Master内存：存储整个集群所有的Region信息，状态变更由RegionServer通知到ZooKeeper再通知到Master，所以会有信息滞后。在HBase Master WebUI上看到的Region状态均来自于此
     3. ZooKeeper的region-in-transition节点：存储临时性状态转移信息，作为Master和RegionServer间反馈Region状态的通道
     - 当这三个状态不一致时，就会出现Region In Transition（RIT）现象
     - Region在迁移的过程中必然会出现短暂的RIT状态，无需任何人工干预操作
@@ -524,8 +524,8 @@
         - 在内存中初始化两个子Region，具体为两个HRegionInfo对象
         - 同时生成一个transaction journal，用于记录分裂的进展
     2. execute阶段
-        1. RegionServer将ZK节点/region-in-transition中该Region的状态更新为SPLITTING
-        2. Master通过watch同一个ZK节点检测到Region状态改变，并修改内存中Region状态（在Master页面RIT模块中可见）
+        1. RegionServer将ZooKeeper节点/region-in-transition中该Region的状态更新为SPLITTING
+        2. Master通过watch同一个ZooKeeper节点检测到Region状态改变，并修改内存中Region状态（在Master页面RIT模块中可见）
         3. 在父存储目录下新建临时文件夹.split，保存split后的daughter region信息
         4. 关闭父Region。父Region关闭数据写入并触发flush操作，将写入Region的数据全部持久化磁盘。此时短期内客户端落在父Region上的请求都会抛出异常NotServingRegionException
         5. 在.split文件夹下新建两个子文件夹，daughter A和B，并在文件夹中生成reference文件，分别指向父Region中的对应文件（**最核心的一步**）
@@ -568,11 +568,11 @@
 - 一些常见的可能导致RegionServer宕机的异常：Full GC、HDFS异常、物理机器宕机、HBase BUG
 ### 9.2 HBase故障恢复基本原理
 1. Master故障恢复原理
-    - HBase采用热备方式来实现Master高可用，通常要求集群中至少启动两个Master进程，进程启动后会到ZK上的Master节点进行注册，注册成功后会成为Active Master，未成功的其它进程会在Backup-Masters节点进行注册，并持续关注Active Master的情况，一旦Active Master宕机，它们会立刻得到通知并再次竞争注册Master节点
+    - HBase采用热备方式来实现Master高可用，通常要求集群中至少启动两个Master进程，进程启动后会到ZooKeeper上的Master节点进行注册，注册成功后会成为Active Master，未成功的其它进程会在Backup-Masters节点进行注册，并持续关注Active Master的情况，一旦Active Master宕机，它们会立刻得到通知并再次竞争注册Master节点
     - Active Master会接管整个系统的元数据管理任务，以及响应用户的各种管理命令
 2. RegionServer故障恢复原理
     - RegionServer发生宕机时HBase会马上检测到，并将宕机RegionServer上的所有Region重新分配到集群中其他正常的RegionServer上，再通过HLog进行丢失数据恢复，完成之后就可以对外提供服务，无需人工干预，流程如下：
-    1. Master检测宕机是通过ZK实现的，RegionServer会周期性向ZK发送心跳，一旦心跳停止发送并超时，则ZK认为该RegionServer宕机离线
+    1. Master检测宕机是通过ZooKeeper实现的，RegionServer会周期性向ZooKeeper发送心跳，一旦心跳停止发送并超时，则ZooKeeper认为该RegionServer宕机离线
     2. RegionServer宕机后MemStore中还未持久到文件的这部分数据必然会丢。HLog中所有Region的数据都混合存储在同一个文件中，为了使数据能够按照Region进行组织回放，需要将HLog日志进行切分再合并，将同一个Region的数据最终合并在一起
     3. Master重新分配宕机RegionServer上的Region，但还未上线
     4. 回放HLog日志补救数据
@@ -592,24 +592,24 @@
 - Peer是指一条从主集群到备份集群的复制链路
 - HBase2.x的复制管理流程：
     1. Client将创建Peer的请求发送到Master
-    2. Master内实现了一个名为Procedure的框架，它会将管理操作拆分成N个步骤，每执行完一个步骤都会把状态信息持久化到HDFS，以供异常恢复后继续执行。对于Peer创建来说，Procedure会创建相关的ZNode，并将复制相关的元数据保存在ZK中
+    2. Master内实现了一个名为Procedure的框架，它会将管理操作拆分成N个步骤，每执行完一个步骤都会把状态信息持久化到HDFS，以供异常恢复后继续执行。对于Peer创建来说，Procedure会创建相关的ZNode，并将复制相关的元数据保存在ZooKeeper中
     3. Master的Procedure会向每一个RegionServer发送创建Peer的请求，直到所有RegionServer都成功创建Peer；否则会重试
     4. Master返回给HBase客户端
 - HBase2.x的复制流程：
-    1. 创建Peer时，每一个RegionServer会创建一个ReplicationSource线程，把当前正在写入的HLog保存在复制队列中，然后在RegionServer上注册一个Listener，用于监听HLog Roll操作，一旦操作发生，ReplicationSource会把这个HLog分到对应的walGroup-Queue中，同时把HLog文件名持久化到ZK上
+    1. 创建Peer时，每一个RegionServer会创建一个ReplicationSource线程，把当前正在写入的HLog保存在复制队列中，然后在RegionServer上注册一个Listener，用于监听HLog Roll操作，一旦操作发生，ReplicationSource会把这个HLog分到对应的walGroup-Queue中，同时把HLog文件名持久化到ZooKeeper上
     2. 每个walGroup-Queue后端辰一个ReplicationSourceWALReader线程，会不断地从Queue中取出一个HLog，然后把其中的Entry逐个读出来，放到一个名为entryBatchQueue的队列中
-    3. entryBatchQueue队列后端有一个名为ReplicationSourceShipper的线程，不断地从Queue中取出Log Entry，交给Peer的ReplicationEndpoint。后者将这些Entry打包成一个replicateWALEntry操作，通过RPC发送到Peer集群的某个RegionServer上。对应Peer集群的RegionServer将replicateWALEntry解析成若干个Batch操作，并调用batch接口执行。RPC调用成功后，ReplicationSourceShipper会更新最近一次成功复制的HLog Position到ZK
+    3. entryBatchQueue队列后端有一个名为ReplicationSourceShipper的线程，不断地从Queue中取出Log Entry，交给Peer的ReplicationEndpoint。后者将这些Entry打包成一个replicateWALEntry操作，通过RPC发送到Peer集群的某个RegionServer上。对应Peer集群的RegionServer将replicateWALEntry解析成若干个Batch操作，并调用batch接口执行。RPC调用成功后，ReplicationSourceShipper会更新最近一次成功复制的HLog Position到ZooKeeper
 ## 10.2 串行复制
-- 非串行复制导致的问题：当Region从一个RS移到另外一个RS的过程中，Region的数据会分散在两个RS的HLog上，而两个RS完全独立地推送各自的HLog，从而导致同一个Region的数据并行写入Peer集群
-- 一个简单的解决思路：把Region的数据按照Region移动发生的时间点t0分成两段，小于t0的数据在RS0的HLog上，大于t0的数据在RS1的HLog上。推送时先让RS0推，等它推完再让RS1推，以保证顺序一致性
+- 非串行复制导致的问题：当Region从一个RegionServer移到另外一个RegionServer的过程中，Region的数据会分散在两个RegionServer的HLog上，而两个RegionServer完全独立地推送各自的HLog，从而导致同一个Region的数据并行写入Peer集群
+- 一个简单的解决思路：把Region的数据按照Region移动发生的时间点t0分成两段，小于t0的数据在RegionServer0的HLog上，大于t0的数据在RegionServer1的HLog上。推送时先让RegionServer0推，等它推完再让RegionServer1推，以保证顺序一致性
 - 目前社区版本的实现思路大概如同上述，其中有三个重要概念：
-    1. Barrier：与上述思路的t0相似，每次Region重新assign到新RS时，新RS打开Region前能读到的最大SequenceId（对应此Region在HLog中的最近一次写入数据分配的SequenceId）。因此每Open一次Region，就会产生一个新Barrier，N个Barrier将Region的SequenceId数轴划分为N+1个区间
+    1. Barrier：与上述思路的t0相似，每次Region重新assign到新RegionServer时，新RegionServer打开Region前能读到的最大SequenceId（对应此Region在HLog中的最近一次写入数据分配的SequenceId）。因此每Open一次Region，就会产生一个新Barrier，N个Barrier将Region的SequenceId数轴划分为N+1个区间
     2. LastPushedSequenceId：该Region最近一次成功推送到Peer集群的HLog的SequenceId，每次成功推送一个Entry到Peer集群后，都需要将此值更新
     3. PendingSequenceId：该Region当前读到的HLog的SequenceId
 - HBase只需对每个Region维护一个Barrier列表和LastPushedSequenceId即可按照规则确保数据区域推送的顺序一致
-- 位置靠后的RS会检查LastPushedSequenceId的值来判断当前的进度，如果没轮到自己就休眠一会之后再来检查
+- 位置靠后的RegionServer会检查LastPushedSequenceId的值来判断当前的进度，如果没轮到自己就休眠一会之后再来检查
 ## 10.3 同步复制
-- 设计思路：RS在收到写入请求后，除了在主集群上写HLog日志，还会在备份集群上写一份RemoteWAL日志，只有等HLog+RemoteWAL+MemStore写入成功后才会返回成功给客户端。除此之外，主备集群间还会开启异步复制链路（双保险？），当主集群的HLog通过异步复制推送到备份集群后其对应的RemoteWAL才会被清理。因此RemoteWAL可以认为是成功写入主集群但未被异步复制成功推送到备份集群的数据
+- 设计思路：RegionServer在收到写入请求后，除了在主集群上写HLog日志，还会在备份集群上写一份RemoteWAL日志，只有等HLog+RemoteWAL+MemStore写入成功后才会返回成功给客户端。除此之外，主备集群间还会开启异步复制链路（双保险？），当主集群的HLog通过异步复制推送到备份集群后其对应的RemoteWAL才会被清理。因此RemoteWAL可以认为是成功写入主集群但未被异步复制成功推送到备份集群的数据
 1. 集群复制的几种状态
     - Active：该状态下的集群将在远程集群上写RemoteWAL日志，同时拒绝接收来自其他集群的复制数据。一般情况下，同步复制中的主集群会牌Active状态
     - Downgrade Active(DA)：该状态下的集群将跳过写RemoteWAL流程，同时拒绝接收来自其他集群的复制数据。一般情况下，同步复制中的主集群因备份集群不可用卡住后会被降级为DA状态，以满足业务的实时读写
@@ -635,3 +635,56 @@
     - 若主集群故障，异步复制下服务不可用，同步复制下只需花少许时间重放RemoteWAL便可恢复服务
     - 同步复制的运维操作更复杂，需要理解集群状态并手动切换主备集群
     - 同步复制下的写入性能会稍低13%左右
+
+## 第11章 备份与恢复
+### 11.1 Snapshot概述
+1. HBase备份与恢复工具的发展过程
+    - 使用distcp进行关机全备份：使用Hadoop提供的文件复制工具distcp将HBase目录复制到另一个目录中。但需要关闭当前集群，不提供所有读写操作服务
+    - 使用copyTable工具在线跨集群备份：通过MapReduce程序全表扫描数据并写入另一个集群。不需要关闭源集群，但会极大增加服务压力，并且耗时长，只能保证行级一致性
+    - 使用Snapshot在线备份：以快照技术为基础原理，不需要拷贝任何数据，速度快，几乎对服务无影响，能保证数据一致性
+2. 在线Snapshot备份能实现什么功能
+    - 全量/增量备份：可以在异常发生时快速回滚到指定快照点
+    - 数据迁移：可以使用ExportSnapshot功能将快照导出到另一个集群，实现数据迁移（如将数据导出到HDFS供Hive/Spark等离线OLAP进行分析）
+3. 在线Snapshot备份与恢复的用法
+    - snapshot：为表打一个快照，但不涉及数据移动
+    - restore_snapshot：用于恢复指定快照，恢复过程会替代原有数据，快照点之后的所有更新会丢失
+    - clone_snapshot：根据快照恢复出一个新表，不涉及数据移动
+    - ExportSnapshot：将集群A的快照数据迁移到集群B，是HDFS层面的操作，使用MapReduce进行数据的并行迁移，Master和RegionServer并不参与，不会带来额外内存与GC开销。但DataNode在拷贝数据时需要额外带宽及IO负载（可以用参数限制带宽）
+### 11.2 Snapshot创建
+#### 11.2.1 Snapshot技术原理
+- Snapshot机制并不拷贝数据，因为在HBase的LSM树类型系统结构下数据只会被不断地追加，因此实现某个表的Snapshot只需为当前表的所有文件分别新建一个引用。对于其它新写入的数据，重新创建一个新文件写入即可
+- Snapshot流程中需要将MemStore中的缓存数据flush到文件中，之后为所有HFile文件分别新建引用指针，这些指针元数据就是Snapshot
+#### 11.2.2 在线Snapshot的分布式架构——两阶段提交
+- Snapshot需要保证分布在多个RegionServer上的Region要么全部完成Snapshot，要么都不做，不能出现中间状态
+- Snapshot的两阶段提交实现：
+- prepare阶段：
+    1. Master在ZooKeeper创建一个/acquired-snapshotname节点，并在此节点上写入Snapshot相关信息
+    2. 所有RegionServer监测到这个节点，根据其携带的Snapshot表信息查看当前RegionServer上是否存在目标表，如果存在则遍历目标表中的所有Region，针对每个Region分别Snapshot，操作结果写入临时文件夹
+    3. RegionServer执行完成后在/acquired-snapshotname节点下新建一个子节点/acquired-snapshotname/nodex，表示nodex节点完成了Snapshot准备工作
+- commit阶段：
+    1. 一旦所有RegionServer完成Snapshot并建立了相应节点，Master便认为准备工作完成，会新建一个/reached-snapshotname节点，表示发送一个commit命令给参与的RegionServer
+    2. 所有RegionServer监测到这个节点后会执行commit操作，也就是将临时文件夹中的数据移动到最终文件夹
+    3. RegionServer在/reached-snapshotname节点下新建子节点/nodex表示节点nodex完成了Snapshot工作
+- abort阶段：
+    - 如果一定时间内/acquired-snapshotname节点个数没有满足条件，则认为准备工作超时，Master会新建另一节点/abort-snapshotname，所有RegionServer监听到后会清理临时文件夹中的Snapshot数据
+- 可以看出在此过程中，Master充当了协调者，RegionServer充当了参与者，ZooKeeper则是二者之间沟通的桥梁和事务状态记录者
+#### 11.2.3 Snapshot核心实现
+- 每个Region实现Snapshot的流程：
+    1. 将MemStore数据flush到HFile
+    2. 将region info元数据记录到Snapshot文件中
+    3. 将Region中所有HFile文件名记录到Snapshot文件夹中
+- Master会在所有Region完成Snapshot后执行一个汇总（consolidate）操作，将所有region snapshot manifest汇总成一个单独manifest，此文件可以在HDFS目录下找到：/hbase/.hbase-snapshot/snapshotname/data.manifest
+### 11.3 Snapshot恢复
+- 以clone_snapshot为例，其流程如下：
+    1. 预检查，确认当前表没有执行snapshot以及restore等操作，否则返回错误
+    2. 在tmp文件夹下新建目标表目录并在表目录下新建.tabledesc文件，在其中写入表schema信息
+    3. 新建region目录，根据snapshot manifest中的信息新建Region相关目录以及HFile文件
+    4. 将表目录从tmp文件夹下移到HBase Root Location
+    5. 修改hbase:meta表，将克隆表的信息添加进其中（二者的Region名会不一样，因为表名不一样了）
+    6. 将这些Region通过round-robin方式均匀分配到整个集群中，并在ZooKeeper上将克隆表状态设为enabled，正式对外提供服务
+- Snapshot用一种名为LinkFile的文件指向原文件，其中并不包含任何数据，但其文件名可以直接定位到原始文件的具体路径（原始文件表名+引用文件所在Region+引用文件名）
+### 11.4 Snapshot进阶
+- 原始表发生了Compaction时，会将原始表数据复制到archive目录下（不删除），因此Snapshot的引用链仍然有效，只是路径变了
+- 当普通表被删除一段时间后，archive中的数据也会被删除，因为Master上有一个定期清理archive中垃圾文件的线程
+- Snapshot原始表进入archive后不会被删除，因为archive目录下会生成反向引用文件来帮助原始表文件找到引用文件，以此知道自己还不能死
+- 新表在执行compact的时候会将合并后的文件写入到新目录并将相关的LinkFile删除，此时新目录中就是真实数据而不再是引用了
