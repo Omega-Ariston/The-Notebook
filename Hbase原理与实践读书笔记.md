@@ -5,7 +5,7 @@
 - HBase中的基本概念：
     - table：表，一个表包含多行数据
     - row：行，一行数据包含一个唯一标识rowkey、多个column以及对应的值。表中所有row都按照rowkey的字典序从小到大排序
-    - column：列，与关系型数据库中的列不同，column由column family（列簇）以及qualifier（列名）两部分组成，中间使用“：”相连。column family在表他去的时候需要指定，用户不能随意增减。而一个column family下的qualifier可以设置任意多个，因此列可以动态增加，理论上可以扩展到上百万列
+    - column：列，与关系型数据库中的列不同，column由column family（列簇）以及qualifier（列名）两部分组成，中间使用“：”相连。column family在表创建的时候需要指定，用户不能随意增减。而一个column family下的qualifier可以设置任意多个，因此列可以动态增加，理论上可以扩展到上百万列
     - timestamp：时间戳，每个cell在写入HBase的时候都会默认分配一个时间戳作为该cell的版本，同一个rowkey、column下可以有多个value，版本号越大表示数据越新
     - cell：单元格，由五元组（row，column，timestamp，type，value）组成的结构，type表示put/delete这样的操作类型，timestamp表示版本。这个结构是以KV结构存储的，前四个元素组成的元组为key，value为value
 - 总体而言，HBase引入了列簇的概念，列簇下的列可以动态扩展，时间戳则用以实现了数据的多版本支持
@@ -78,7 +78,7 @@
 ### 2.3 布隆过滤器
 - HBase1.x版本中的两种布隆过滤器：
     - ROW：按照rowkey来计算布隆过滤器的二进制串并存储。Get查询的时候必须带rowkey
-    - ROWCOL：按照rowkey+family+qualifier这3个字段拼出byte[]来计算布隆过滤器值并存储，但在查询的时候，Get中只要缺少3个字段中任意一个，就无法通过布隆过滤器发觉他性能，因为key不确定
+    - ROWCOL：按照rowkey+family+qualifier这3个字段拼出byte[]来计算布隆过滤器值并存储，但在查询的时候，Get中只要缺少3个字段中任意一个，就无法通过布隆过滤器提升性能，因为key不确定
 - 一般意义上的Scan都无法通过布隆过滤器来提升扫描数据性能，因为key不确定，但在某些特定场景下Scan操作可以借其提升性能，如对于ROWCOL类型的过滤器，在Scan操作中明确指定需要扫某些列。
 - 在Scan过程中，碰到KV数据从一行换到新一行时，没法走ROWCOL布隆过滤器，因为新一行的Key值不确定，但是在同一行数据内切换列时可以进行优化，因为rowkey确定，同时column也已知
 
@@ -688,3 +688,61 @@
 - 当普通表被删除一段时间后，archive中的数据也会被删除，因为Master上有一个定期清理archive中垃圾文件的线程
 - Snapshot原始表进入archive后不会被删除，因为archive目录下会生成反向引用文件来帮助原始表文件找到引用文件，以此知道自己还不能死
 - 新表在执行compact的时候会将合并后的文件写入到新目录并将相关的LinkFile删除，此时新目录中就是真实数据而不再是引用了
+
+## 第12章 HBase运维
+- 暂时还用不上，先跳过
+
+## 第13章 HBase系统调优
+### 13.1 HBase GC调优
+- 每种应用都会有自己的内存对象特性，一般可分为两种：短寿对象居多的工程，比如大多数纯HTTP请求处理工程；长寿对象居多的工程，比如类似于HBase、Spark等大内存工程
+- RPC请求对象，比如Request对象和Response对象，会随着短连接RPC的销毁而消亡，属于短寿对象
+- MemStore对象，用户写入数据到MemStore中之后对象会一直存在，直到MemStore写满后flush到HDFS，属于长寿对象
+- BlockCache对象，与MemStore对象类似，属于长寿对象
+- 一般CMS需要动态调整优化的参数有-Xmn和-XX:SurvivorRatio两个
+### 13.2 G1 GC性能调优
+- G1 GC核心参数：
+    - MaxGCPauseMillis：每次G1 GC的目标停顿时间，是一个软限制，不保证每次SWT都严格小于该值，只是尽量
+    - G1NewSizePercent：young区占比的下限，G1会根据MaxGCPauseMillis动态调整young区大小，但不会小于此值
+    - InitiatingHeapOccupancyPercent（IHOP）：G1开始进行并发标记的阈值
+    - MaxTenuringThreshold：被放入老年代前最多经历的young GC次数
+    - G1HeapRegionSize：用于控制G1划分的每个Region的大小，需要带单位（m）
+    - G1MixedGCCountTarget：一个mixed GC周期中最多执行的mixed GC次数
+    - G1OldCSetRegionThresholdPercent：一次mixed GC最多能回收多大的OldRegion空间
+- 通常的调优方法是，把MaxGCPauseMillis调大，但同时young GC的耗时也会变长。小技巧：把G1NewSizePercent调大，通过观察可以发现young GC在非mixed GC周期内，young区大小约为4%，所以把G1NewSizePercent设为4。这样对young GC不会有影响，但可以避免young区在mixed GC周期内被耗尽
+- G1 GC的调优思路：
+    1. IHOP需要考虑常驻内存对象的总大小
+    2. 通过G1NewSizePercent和MaxGCPauseMillis来控制Young GC的耗时和触发mixed GC的时间间隔
+    3. 通过MixedGCCountTarget和OldCSetRegionThreshold来控制每次Mixed GC周期内执行mixed GC的次数以及单次mixed GC的耗时
+    4. 注意选择正确的SurvivorRatio
+### 13.3 HBase操作系统调优
+1. Linux swap基本概念
+    - swap机制：当物理内存不足时，拿出部分硬盘空间当swap分区
+    - 几乎所有数据库对swap都不怎么待见，原因有2：
+        1. 数据库系统一般对响应延迟比较敏感，用swap代替内存会使服务性能变得不可接受，如果不使用swap而是直接把进程kill掉，反而可以通过高可用系统自动恢复，用户基本无感知
+        2. 对于HBase这类分布式系统而言，并不担心某个节点宕掉，而更担心某个节点卡住，从而导致所有分布式请求夯住
+2. set vm.min_free_kbytes to at least 1GB
+    - 数据库通常不会放弃使用swap，而是选择尽量少用
+    - Linux触发内存回收的两种场景：
+        1. 内存分配时发现没有足够空闲内存
+        2. 开启swapd守护进程时会周期性对系统内存进行检查，在可用内存降低到特定阈值时
+    - vm.min_free_kbytes参数用于标注第2点中的最低水位线
+    - 若上述值太小，buffer就会很小，一旦上层申请内存速度太快（典型应用：数据库），会导致空闲内存极易降至水位线下，此时内核会直接在应用程序的进程上下文中进行回收，再用回收上来的空闲页满足内存申请，阻塞应用程序
+    - 若上述值太大，会导致应用程序进程内存减少，浪费系统内存资源，还会导致kswapd进程花费大量时间进行内存回收
+    - 官方文档建议此值大于1G，意味着不要轻易触发直接回收
+3. Set vm.swappiness = 0
+    - Linux内存回收对象主要分为两种：
+        1. 文件缓存：系统会将热点数据存储在内存中提高性能，如果缓存的文件数据进行了修改则回收内存时需要将这部分数据文件写回硬盘，否则直接释放即可
+        2. 匿名内存：没有实际的持久化载体，如堆栈数据等，回收时不能直接释放，因此提出swap机制将他们换出到硬盘中，需要时再加载回来
+    - swappiness用于指定系统在回收上述两类内存时的积极性，取值范围为0-100，默认60，表示文件缓存被优先回收，100则表示两者将用同样的优先级进行回收。对于数据库来说，尽量避免swap，所以设为0，但不代表swap不发生
+4. Disable NUMA zone reclaim
+    - NUMA架构下每个CPU都有专属内存区域，两个软件层面支持：
+        1. 内存分配需要在请求线程当前所处的CPU专属内存区域进行分配，如果分配到其它区域则隔离性会受到一定影响，并且跨越总线的内存访问性能会降低
+        2. 一旦local内存不够用，优先淘汰local内存中的内存页，而不是去借用远程内存区的空闲内存
+    - 对于数据库来说，NUMA容易导致CPU内存使用不均衡，部分cpu专属内存不够导致频繁回收，进而可能发生swap，而其它cpu的内存可能都很空闲，**此时用free命令查看操作系统还有空闲内存但系统却不断发生swap，很诡异**。因此数据库一般要对NUMA策略做一些修改：
+        - 将内存分配策略由默认的亲和模式改为interleave模式，将内存page打散分配到不同的cpu zone中，解决内存可能分布不均的问题
+        - 改进内存回收策略，涉及参数zone_reclaim_mode，可以规定local内存不够用的情况下优先考虑的事情，0代表去其它内存区域分配内存，1代表先本地回收，2代表本地回收优先回收文件缓存对象，4代表本地回收优先回收匿名内存
+5. Turn transparent huge pages(THP) off
+    - 关闭THP特性是各种数据库极力推荐的
+    - Huge Page：使用2M的大内存页替代传统的4K小页，以避免当机器内存大时，内存页过多导致索引表占用空间大的问题
+    - 目前THP只针对匿名内存区域
+    - THP是一种动态管理策略，会在运行期动态分配大页给应用并对其进行管得，会导致一定程度的分配延时（性能可能下降30%左右！）
