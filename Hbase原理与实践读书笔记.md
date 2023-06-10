@@ -746,3 +746,67 @@
     - Huge Page：使用2M的大内存页替代传统的4K小页，以避免当机器内存大时，内存页过多导致索引表占用空间大的问题
     - 目前THP只针对匿名内存区域
     - THP是一种动态管理策略，会在运行期动态分配大页给应用并对其进行管得，会导致一定程度的分配延时（性能可能下降30%左右！）
+### 13.4 HBase-HDFS调优策略
+1. Short-Circuit Local Read
+    - DataNode收到客户端的读取数据请求后会从磁盘读数据并通过TCP发送给客户端，对于本地数据，Short Circuit Local Read策略允许客户端绕过DataNode直接从磁盘上读取本地数据，减少多次网络传输开销
+2. Hedged Read
+    - 通常情况下HBase会在HDFS的三副本中根据算法优先选择一个DataNode进行数据读取，但有时可能因为磁盘问题或网络问题引起读取超时
+    - 根据Hedged Read策略，如果在指定时间内读取请求没有返回，HDFS客户端会向第二个副本发送第二次数据请求，谁先返回就使用谁，后返回的会被丢弃
+3. Region Data Locality
+    - 数据本地率，表示当前Region的数据在Region所在节点存储的比例
+    - 本地率低一般是由于Region迁移（自动balance、RegionServer宕机、手动迁移）导致，因此可以通过避免无故迁移来提高数据本地率，比如关闭自动balance、RegionServer宕机及时拉起并迁回飘走的Region等，或在业务低峰期通过major_compaction将数据本地率提升到100%
+### 13.5 HBase读取性能优化
+#### 13.5.1 HBase服务器端优化
+1. 读请求是否均衡？
+    - 观察所有RegionServer的读请求QPS曲线，确认是否存在读请求不均衡现象
+    - Rowkey必须进行散列化处理（比如MD5散列），同时建表必须进行预分区处理
+2. BlockCache设置是否合理？
+    - 默认情况下BlockCache和MemStore的配置相对比较均衡（各占40%）
+    - 读多写少时BlockCache占比可以调大
+    - BlockCache的策略对读性能来说影响不大，但对GC影响很大，BucketCache的offheap模式下GC表现很优秀
+    - 观察所有RegionServer的缓存未命中率、配置文件相关配置项以及GC日志，确认BlockCache是否可以优化
+    - 如果JVM内存配置量小于20G，选择LRUBlockCache；否则选择BucketCache的offheap模式
+3. HFile文件是否太多？
+    - 查找数据时会在HFile中检索，文件越多，IO次数越多，读取延迟越高
+    - 观察RegionServer级别以及Region级别的HFile数，确认HFile文件是否过多
+    - hbase.hstore.compaction.max.size不宜设置太小
+    - hbase.hstore.compactionThreshold设置不能太大，默认为3
+4. Compaction是否消耗系统资源过多？
+    - 通过观察系统IO资源以及带宽资源使用情况，再观察Compaction队列长度，确认是否由于Compaction导致系统资源消耗过多
+    - 对于大Region读延迟敏感的业务（大于100G）一般不建议开启自动Major Compaction，小Region或者延迟不敏感的业务可以开启，但建议限制流量
+5. 数据本地率是不是很低？
+    - 观察所有RegionServer的数据本地率（Table Web UI）
+    - 尽量避免Region无故迁移，业务低峰期可手动执行major_compaction提高本地率
+#### 13.5.2 HBase客户端优化
+1. scan缓存是否设置合理？
+    - 大scan场景下将scan缓存从100增大到500或者1000，用以减少RPC次数
+2. get是否使用批量请求？
+    - 使用批量get进行读取请求可以减少客户端到RegionServer之间的RPC连接数，但要注意对读取延迟敏感的业务，每次批量数不能太大，需要测试
+3. 请求是否可以显式指定列簇或者列？
+    - 如果只是根据rowkey而不指定列簇进行检索，不同列簇的数据需要独立进行检索（物理位置不同），性能会损耗，尽量指定列簇或者列进行精确查找
+4. 离线批量读取请求是否设置禁止缓存？
+    - 通常在离线批量读取数据时会进行一次性全表扫描，大量数据会进入缓存，挤出其它实时业务热点数据，造成读延迟毛刺，所以此时应该设置禁用缓存
+#### 13.5.3 HBase列簇设计优化
+- 布隆过滤器是否设置？
+    - 任何业务都应该设置布隆过滤器，通常设置为row，除非确认业务随机查询类型为row+column，则设置为rowcol
+### 13.6 HBase写入性能调优
+#### 13.6.1 HBase服务器端优化
+1. Region是否太少？
+    - 在#Region of Table < #RegionServer的情况下切分部分请求负载高的Region，并迁移到其它RegionServer
+2. 写入请求是否均衡？
+    - 单节点负载很高可能会拖慢整个集群，因为很多业务会使用Multi批量提交读写请求，落到慢节点的那部分请求会导致整个批量请求超时
+    - 检查Rowkey设计以及预分区策略，保证写入请求均衡
+3. Utilize Flash storage for WAL
+    - 此特性会将WAL文件写到SSD上，对于写性能有非常大的提升
+#### 13.6.2 HBase客户端优化
+1. 是否可以使用Bulkload方案写入？
+    - 程序的输入是指定数据源，输出是HFile文件，生成HFile文件后再通过LoadIncrementalHFiles工具将HFile中相关元数据加载到HBase中
+2. 是否需要写WAL？WAL是否需要同步写入？
+    - 数据写入流程可以理解为一次顺序写WAL+一次写缓存，写缓存一般延迟很低，因此优化主要从WAL入手
+    - 根据业务关注点在WAL机制与写入吞吐量之间权衡，对吞吐量要求很高且不怕丢失数据的情况下可以考虑关闭WAL写入
+3. Put是否可以同步批量提交？
+    - 使用批量提交可以减少RPC连接数，提高吞吐，但批量请求要么全部成功返回，要么抛出异常
+4. Put是否可以异步批量提交？
+    - 异步提交分两阶段执行：用户提交写请求，数据写入客户端缓存并返回写入成功；当客户端缓存达到阈值（默认2M）后批量提交给RegionServer。在异常情况下缓存数据可能丢失
+5. 写入KeyValue数据是否太大？
+    - KeyValue大小对写入性能影响巨大，一旦遇到写入性能较差的情况，需要分析是否是这个原因，写入延迟在100K之后会急剧增大
