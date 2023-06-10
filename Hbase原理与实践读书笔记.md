@@ -810,3 +810,130 @@
     - 异步提交分两阶段执行：用户提交写请求，数据写入客户端缓存并返回写入成功；当客户端缓存达到阈值（默认2M）后批量提交给RegionServer。在异常情况下缓存数据可能丢失
 5. 写入KeyValue数据是否太大？
     - KeyValue大小对写入性能影响巨大，一旦遇到写入性能较差的情况，需要分析是否是这个原因，写入延迟在100K之后会急剧增大
+
+## 第14章 HBase运维案例分析
+- 暂时还用不上，先跳过
+
+## 第15章 HBase2.x核心技术
+### 15.1 Procedure功能
+- 本质是通过设计一个分布式任务流框架，来保证这个任务流框架中的多个步骤全部成功，或全部失败，即保证分布式任务流的原子性
+1. Procedure定义
+    - 一个Procedure一般由多个subtask组成，每个subtask是一些执行步骤的集合，这些执行步骤中又会依赖部分Procedure
+    - Procedure提供的两个接口：execure()和rollback()，分别用于实现Procedure的执行和回滚逻辑，实现时需要保证幂等性
+2. Procedure执行和回滚
+    - Procedure Store：Procedure内部的任何状态变化，都会被持久化到HDFS中（通过在Master的内存中维护一个实时Procedure镜像，并把更新按顺序写入Procedure WAL日志中）
+    - 回滚栈：用于将Procedure的执行过程一步步记录在栈中，若要回滚，则一个个出栈依次回滚，即可保证整体任务流的原子性
+    - 调度队列：Procedure在调度时使用的一个双向队列，调度优先级高的Procedure进入队首，不高的进入队尾
+    - Procedure可以有子Procedure，他们都是多线程并发执行的，所以需要保证它们之前可以并行执行（不存在依赖关系）
+3. Procedure Suspend
+    - 执行Procedure时，可能在某个阶段遇到异常需要重试，多次重试之间可以设定休眠时间，以防频繁重试导致系统恶化
+    - Suspend的Procedure会放入DelayedQueue，待休眠时间结束后由一个叫做TimeoutExecutorThread的线程取出并放到调度队列中继续执行
+4. Procedure Yield
+    - Procedure V2提供的另一种处理重试方式：把当前异常的Procedure直接从调度队列中移走，并将Procedure添加到调度队列队尾，等前面所有Procedure都执行完成后再执行上次有异常的Procedure，达到重试目的
+### 15.2 In Memory Compaction
+- 一个表有多个Column Family，每个Column Family是一个LSM树索引结构，LSM树又细分为一个MemStore和多个HFile。当MemStore占用内存超过128MB（默认）时，开始将MemStore切换为不可写的Snapshot，并创建一个新的MemStore供写入，然后将Snapshot异步地flush到磁盘上，最终生成一个HFile文件。其本质是一个维护cell有序的ConcurrentSkipListMap
+1. Segment
+    - Segment的本质是维护一个有序的cell列表，根据cell列表是否可更改，Segment分为两种类型：
+        1. MutableSegment：支持添加、删除、扫描、读取指定cell，一般用一个ConcurrentSkipListMap来维护列表
+        2. ImmutableSegment：只支持扫描cell和读取指定cell这种查找类操作，因此只需一个数组维护即可
+2. CompactingMemstore
+    - CompactingMemstore将原来128MB的大Memstore划分成很多个小的Segment，包括一个Mutable的和多个Immutable的
+    - 该Column Family的写入操作会先写入MutableSegment，一旦发现MutableSegment占用的空间超过2MB，就将当前Mutable转变为Immutable，再初始化一个新的Mutable供后续写入
+    - CompactingMemstore中的所有ImmutableSegment称为一个Pipeline对象，其本质就是按照Immutable加入的顺序，组织成一个FIFO队列
+    - 当对该Column Family发起读取操作时，需要将这个CompactingMemstore中的一个Mutatle和多个Immutable以及磁盘上的多个HFile组织成多个内部数据有序的Scanner，然后将这些Scanner通过多路归并算法合并生成Scanner，最终通过它来读取数据
+    - 当Immutable个数不断增加时，需要多路归并的Scanner也会变多，从而降低读性能，因此当Immutable数量达到阈值（默认2）时，CompactingMemstore会触发一次In Memory的Memstore Compaction，将所有Immutable归并为一个，得以控制Scanner数量，这个过程中还能顺带清除一些无效数据来节省内存，比如TTL过期数据、超过Family指定版本的cell、被用户删除的cell
+3. 更多优化
+    - ConcurrentSkipListMap是一个内存和CPU开销较大的数据结构，使用In Memory Compaction后，Immutable可以改用数组来维护有序列表，至少节省了跳表最底层链表上所有节点的内存开销
+    - Immutable占用的内存更少，同样是128M的MemStore，CompactingMemstore可以在内存中存放更多数据，触发Flush的频率会相应减少，每次Flush的数据量会相应增加，HFile数量增长会减缓，带来的收益诸多：
+        1. 磁盘上Compaction的触发频率降低，节省了磁盘和网络带宽
+        2. HFile数量减少，读取性能提升
+        3. 写入的数据在内存中保存时间增加，写完即读的场景下性能提升
+    - 用数组代替跳表后，查找可以通过二分法优化，虽然复杂度都是O(logN)，但常数项好很多
+    - ImmutableSegment中的cell可以在Chunk中凑零为整，减少内存占用
+### 15.3 MOB对象存储
+- 在KV存储中，一般按照KV所占字节数大小进行分类：
+    - 小于1MB：Meta数据
+    - 大于1MB，小于10MB：MOB数据（中等大小）
+    - 大于10MB：LOB数据，即大对象
+- 对HBase来说，存储Meta数据最为理想，MOB和LOB两种场景一般需要其他的存储服务满足需求，比如HDFS可以存储LOB
+- MOB的存储相对麻烦，但其需求很常见，例如图片和文档的存储，或HBase中某些业务的Value超过1MB也正常
+- HBase存储MOB或LOB会碰到的问题：
+    - 写少数几个MOB的cell数据就需要进行Flush操作，频繁的Flush会造成HDFS上HFile文件过多，影响读性能
+    - HFile文件变多后，随之而来的还有Compaction频率增加
+    - MOB数据写入也会导致频繁触发Region分裂，影响读写操作延迟（因为需要offline->online）
+1. HBase MOB设计
+    - 本质是将Meta数据与MOB数据分开存放到不同的文件中（用Meta数据去定位MOB数据）
+    - cell首先写入MemStore，在Flush的时候将Meta数据和cell的Value分开存储到不同文件中（cell仍然写MemStore是为了避免在Flush过程中Meta数据和MOB数据不一致，因此cell的Value数据量不能太大）
+    1. 写操作：
+        - 建表时可以对某个Family设置MOB属性，并指定MOB阈值，当cell的Value超过MOB阈值，则按照MOB的方式存储cell
+        - MOB数据仍然会先写WAL日志，再写MemStore，但是flush时RegionServer会判断当前取到的cell是否为MOB cell，若是，则把Meta数据写正常的StoreFile，MOB的Value则写入到MobStoreFile中
+        - Meta数据cell内存储的五元祖中的前四个与原始cell相同，但value部分存储的是MOB cell中Value的长度（4B）和实际存储的文件名（72B）这两个tag
+        - MobStoreFile位于一个全新的目录，这个目录中的regionEncodedName是一个虚构的名字，所以一个表只有一个存储MOB文件的目录
+        - MobStoreFile文件通过名字即可知道StoreFile位于哪个Region、所有cell中最大的时间戳以及一个唯一标识UUID
+    2. 读操作：
+        - 首先按照正常的方式读取StoreFile，若读出来的cell不包含tag，则直接将cell返回给用户，否则解析这个cell的Value值，找到对应的MobStoreFile文件，并在其中读取对应的cell
+        - 默认的BucketCache最大只缓存513KB的cell，所以大部分MOB cell没法被缓存
+        - MOB也有对应的Compaction策略，但频率会设置得很低，以避免MOB导致的写放大现象
+- MOB的局限性：
+    - 每次cell写入都要存MemStore，导致没法存储Value过大的cell，否则内存会被耗尽
+    - 暂时不支持基于Value过滤的Filter，一般也很少有人会对MOB对象的内容过滤
+### 15.4 Offheap读路径和Offheap写路径
+- 整个JVM进程中，HBase占用内存最大的是写缓存（MemStore）和读缓存（BlockCache），一般加起来占80%左右
+- 这两部分内存会在较长时间内被引用（MemStore直到Flush之前，BlockCache直到LRU淘汰前），因此它们会在JVM中长期处于old区，而小对象的频繁申请和释放会导致老年代内存碎片严重，产生大量mixed GC，提高访问延迟
+- 常见的优化方式是事先在JVM中申请一块连续的大内存，将小对象集中存储在这块连续的大内存上，避免堆内出现严重的内存碎片问题（MemStore的MSLAB和BlockCache的BucketCache的核心思想）
+- 对G1这种会在old区整理内存的算法来说，这些占用连续内存的大对象还是可能会被移动，所以虽然GC次数减少了，但每次GC的STW时间还是会很长
+- 另一个优化方式是将old区长期被引用的大对象放到堆外，甚至更进一步，从RegionServer读到客户端RPC请求开始，把所有内存申请都放在堆外，直到RPC请求完成，并通过socket发送给客户端，即读写全路径offheap化
+- offheap方式分配内存的一个弊端是容易发生内存泄漏
+- HBase2.x的内存分配器规则：
+    1. 小于8KB的小内存，仍然从堆内分配器分配
+    2. 大于8KB但不超过64KB的内存直接分配一个64KB的堆外内存
+    3. 大于64KB的较大内存，拆分成N个64KG的堆外内存+0至1个堆内内存（零头）
+- 64KB这个值可以根据业务进行调整，cell字节较大时可以适当调大
+1. 读路径offheap化
+    - HBase2.0之前，读缓存命中BucketCache中的Bucket时，需要先从堆外拷贝一份Block到堆内，再通过RPC将数据发给客户端
+    - HBase2.0开始，缓存命中后会直接把这个Block往上层Scanner传，读路径上并不需要关心Block来自堆外还是堆内（整体ByteBuffer化），减少了一次拷贝的代价及相应造成的年轻代内存垃圾
+2. 写路径offheap化
+    - 服务端收到客户端的写入请求时，可以根据protobuf协议提前知道request的总长度，然后从ByteBufferPool中拿出若干个ByteBuffer存放这个请求
+    - 写入WAL时，通过ByteBuffer接口写入HDFS文件系统（原生HDFS不支持ByteBuffer写入，HBase自己实现的asyncFsWAL支持）
+    - 写入MemStore时，直接将ByteBuffer这个内存引用存入到ConcurrentSkipListMap中，在其内部对象compare时，会通过ByteBuffer指向的内存来比较
+    - 当MemStore flush到HDFS时，KV引用的ByteBuffer才得以最终释放到堆外内存中，如此一来整个KV的内存占用都是在堆外
+### 15.5 异步化设计
+- 对于HBase来说，性能一般由两个指标进行衡量：
+    1. 延迟指标：即单次RPC请求的耗时，包括：get操作的平均延迟耗时，get操作的p75、p99、p999延迟耗时（含义是将n个请求按照耗时从小到大排列，第n个请求的延迟耗时就是pn的耗时）。一般来说，p99延迟受限于系统某个资源，p999则很大程度上与GC有关
+    2. 请求吞吐量：可简单理解为每秒能处理的RPC请求次数，典型的衡量指标是QPS，常见的优化手段有：
+        - 为HBase RegionServer配置合理的Handler数，避免由于个别Handler处理请求太慢导致吞吐量受限，但过大时也会因线程数太多导致频繁上下文切换
+        - 在RegionServer端把读请求与写请求分到两个不同的处理队列中，由两种不同类型的Handler处理，避免出现因部分耗时的读请求影响写入吞吐量的现象
+        - 某些业务场景下采用Buffered Put的方式替换不断自动刷新的put操作
+- HBase2.0进一步推动了关键路径的异步化，最为关键的两点：
+    1. 实现了完全异步的客户端，提供了包括Table和Admin接口在内的所有异步API接口
+    2. 将写路径上最耗时的Append+Sync WAL步骤全部异步化，以期实现更低延迟和更高吞吐
+1. 异步客户端
+    - 当有多个请求串行发送时，异步客户端无需等待前一个请求收到Response才发送下一个请求，而是直接发送后面请求的Request，一旦前面RPC请求收到了Response，再通过预先注册的Callback来处理这个Response
+    - 当HBase出现可用性问题时（如RegionServer或Master由于STW的GC卡住、访问HDFS太慢、RegionServer异常挂掉，某些热点机器系统负载高等），同步请求会被阻塞，影响上层服务体验
+    - 使用异步客户端的注意事项：
+        - 由于异步API调用耗时极短，需要在上层设计合适的API调用频率，否则HBase集群处理速度跟不上请求发送速度，可能导致HBase客户端OOM
+        - 异步客户端的核心耗时逻辑无法直观地体现在Java stacktrace上，会给问题定位增加困难
+2. AsyncFsWAL
+    - RegionServer在执行写入操作时，需要先顺序写HDFS上的WAL日志再写内存中的MemStore，而WAL还需要远程写HDFS的多副本，涉及本地磁盘+网络写入，是写入操作最关键的性能瓶颈
+    - HBase上的每个RegionServer只维护一个WAL日志，因此这个RegionServer上所有写入请求都需要经历以下4个阶段：
+        1. 拿到写WAL的锁
+        2. Append数据到WAL中，相当于写入HDFS Client缓存中，数据并不一定成功写入了HDFS
+        3. Flush数据到HDFS中，本质是将上一步的数据写到HDFS的所有副本，即持久化，一般默认用HDFS hflush接口，而不是hsync接口
+        4. 释放写WAL的锁
+    - 因此，本质上所以的写入操作在操作WAL时，都是按照顺序串行同步写入HDFS的，这很不好
+    - 起初的HBase优化方式：将WAL过程异步化，类似MySQL的Group Commit。将WAL过程拆分成3个子步骤：
+        1. Append操作，由一个名为AsyncWriter的独立线程专门负责执行Append操作
+        2. Sync操作，由一个或多个名为AsyncSyncer的线程专门负责执行Sync操作
+        3. 通知上层写入的Handler，表示当前操作已经写完。再由一个独立的AsyncNotifier线程专门负责唤醒上层Write Handler
+        - 当Write Handler执行某个Append操作时，将这个操作放入RingBuffer队列的尾部，当前的Write Handler开始wait()，等待AsyncWriter线程完成Append操作后将其唤醒
+        - 当Writer Handler调用Sync操作时，也会将这个操作放入同一个RingBuffer队列的尾部，当前线程开始wait()，等待AsyncSyncer完成Sync操作后将其唤醒
+        - RingBuffer队列后有一个消费者线程AsyncWriter，会不断地Append数据到WAL上，并将Sync操作分给多个AsyncSyncer线程中的某一个开始处理
+        - AsyncWriter线程执行完一个Sync操作后，也会唤醒之前wait()的Write Handler
+        - 如此一来，短时间内的多次Append+Sync操作会被缓冲进一个队列，最后一次Sync操作能将之前所有的数据都持久化到HDFS的3副本上，大大降低了HDFS文件的flush次数，提高了单个RegionServer的写入吞吐量
+    - 后来PMC张铎提出的方案：设计一种特殊优化的OutputStream，称为AsyncFsWAL，本质上是将HDFS通过pipeline写三副本的过程异步化
+        - 核心区别在于RingBuffer队列的消费线程设计
+        - 每一个Append操作都缓冲进一个名为toWriteAppends的本地队列
+        - Sync操作则通过Netty框架异步地同时Flush到HDFS三副本上
+    - 目前已经异步化的地方主要包括HBase客户端、RegionServer的RPC网络模型、顺序写WAL等
+## 第16章 高级话题
+- 我还不够高级，看不懂，以后再回来补充
