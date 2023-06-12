@@ -53,3 +53,36 @@
     3. 元数据方式
         - 代表实现是Google Guice，通过Java中的注解（Annotation）标注依赖关系
         - 注解最终也要通过代码处理来确定最终的注入关系，也可以算作是编码方式的一种特殊情况
+### 第4章 Spring的IoC容器之BeanFactory
+- Spring的IoC容器是一个提供IoC支持的轻量级容器，除了基本的IoC支持，还提供了相应的AOP框架支持、企业级服务集成等服务
+- Spring提供了两种容器类型：
+    1. BeanFactory
+        - 基础类型IoC容器，提供完整的IoC服务支持
+        - 默认采用懒加载策略，即只有当客户端对象需要访问容器中某个受管对象时，才对该受管对象进行初始化以及依赖注入操作
+        - 容器启动初期速度相对较快，需要的资源有限，对资源有限且功能要求不严格的场景比较合适
+    2. ApplicationContext
+        - 在前者的基础上构建，是相对比较高级的容器实现
+        - 除了前者的所有支持外还提供了其他高级特性，比如事件发布、国际化信息支持等
+        - 管理的对象在该类型容器启动之后默认全部初始化并绑定完成，因此相较于BeanFactory，要求更多的系统资源，且启动时间更长一些，对系统资源充足且要求更多功能的场景比较合适
+- BeanFactory，顾名思义，生产Bean的工厂，可以完成作为IoC Service Provider的所有职责，包括业务对象的注册和对象间依赖关系的绑定
+- Spring框架提倡使用POJO，把每个业务对象看作一个JavaBean对象
+- BeanFactory会公开一个取得组装完成的对象的方法接口（如getBean）
+- BeanFactory的对象注册与依赖绑定方式：
+    1. 直接编码方式
+        - DefaultListableBeanFactory是BeanFactory接口的一个比较通用的实现类，除了间接地实现了BeanFactory的接口，还实现了BeanDefinitionRegistry接口，其接口定义抽象了Bean的注册逻辑，在BeanFactory实现中担当Bean注册管理的角色
+        - 每一个受管的对象在容器中都会有一个BeanDefinition的实例与之对应，该实例负责保存对象的所有必要信息，包括其对应对象的class类型、是否是抽象类、构造方法参数以及其他属性等
+        - RootBeanDefinition和ChildBeanDefinition是BeanDefinition的两个主要实现类
+        - 实际实用时需要先声明一个BeanFactory容器实例和需要的Bean定义实例，再将Bean定义注册到容器中，并指定依赖关系（构造函数/setter）
+        - 当客户端向BeanFactory请求相应对象时，会得到一个完备可用的对象实例
+    2. 外部配置文件方式
+        - Spring的IoC容器支持两种配置文件格式：Properties和XML，也可以自己引入其它文件格式
+        - 采用此方式时，Spring的IoC容器有一个统一的处理方式，通常情况下需要根据不同的外部配置文件格式，给出相应的BeanDefinitionReader实现类，由相应实现类负责将相应配置文件内容读取并映射到BeanDefinition，再将映射后的BeanDefinition注册到一个BeanDefinitionRegistry中，之后BeanDefinitionRegistry完成Bean的注册和加载
+        - 大部分工作，包括解析文件格式、装配BeanDefinition之类，都由BeanDefinitionReader的相应实现类来做，Registry只负责保管
+        - 如果使用Properties配置格式，Spring提供了PropertiesBeanDefinitionReader类用于配置文件的加载，不用自己实现
+        - XML配置格式是Spring支持最完整，功能最强大的表达方式。Spring提供了XmlBeanDefinitionReader类用于配置文件的加载。除此之外，Spring还在DefaultListableBeanFactory的基础上构建了简化XML格式配置加载的XmlBeanFactory实现
+    3. 注解方式
+        - Spring2.5之前并没有正式支持基于注解方式的依赖注入（注解功能于Java5后引入）
+        - 使用@Autowired和@Component对相关类进行标记
+        - @Autowired告知Spring容器需要为当前对象注入哪些依赖对象
+        - @Component用于配合classpath-scanning功能（需要在Spring配置中开启）使用
+        - classpath-scanning会到指定的package下面扫描标注有@Component的类，添加到容器进行管理，并根据它们所标注的@Autowired为这些类注入符合条件的依赖对象
