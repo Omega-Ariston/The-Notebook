@@ -326,3 +326,85 @@
                 - BeanFactory：需要在独立应用程序的主程序退出之前，或视应用场景，调用ConfigurableBeanFactory的destroySingletons()方法
                 - ApplicationContext：AbstractApplicationContext提供了registerShutdownHook()方法，其底层使用Runtime类的addShutdownHook()方法调用相应bean对象的销毁逻辑，从而保证在JVM退出前销毁逻辑会被执行
             - 使用了自定义scope的对象实例销毁逻辑也应该在合适的时机被调用执行，除了prototype类型的bean实例，因为它们在实例化返回给请求方后生命周期就不归容器管理了
+### 第5章 Spring IoC容器Application Context
+- Spring为基本的BeanFactory类提供了XmlBeanFactory实现，也为ApplicationContext类型容器提供了以下几个实现：
+    - FileSystemXmlApplicationContext：从文件系统加载bean定义以及相关资源
+    - ClassPathXmlApplicationContext：从Classpath加载bean定义以及相关资源
+    - XmlWebApplicationContext：用于Web应用程序
+- ApplicationContext支持了BeanFactory的大部分功能，下面是一些它自有的功能：
+1. 统一资源加载策略
+    - Spring提出了一套基于Resource和ResourceLoader接口的资源抽象和加载策略
+    1. Resource：
+        - Spring框架内部使用Resource接口作为所有资源的抽象和访问接口
+        - Resource接口可以根据资源的不同类型，或资源所处的不同场合，给出相应的具体实现，Spring提供了一些实现类：
+            - ByteArrayResource：将字节数组提供的数据作为一种资源进行封装，如果通过InputStream的形式访问该类型的资源，该实现会根据字节数组的数据，构造相应的ByteArrayInputStream并返回
+            - ClassPathResource：从Java应用程序的ClassPath中加载具体资源并进行封装，可以使用指定的类加载器或者给定的类进行资源加载
+            - FileSystemResource：对java.io.File类型的封装，可以以文件或URL的形式对该类型资源进行访问
+            - UrlResource：通过java.net.URL进行的具体资源查找定位的实现类，内部委派URL进行具体的资源操作
+            - InputStreamResource：将给定的InputStream视为一种资源的Resource实现类，较少用
+        - 也可以自己实现Resource接口，其定义了7个方法，用于查询资源状态、访问资源内容、根据当前资源创建新的相对资源。但建议继承AbstractResource类并覆盖相应方法来实现相同效果
+    2. ResourceLoader：
+        - 是资源查找定位策略的统一抽象，用于查找和定位资源
+        - 接口方法中的getResource(String location)方法可以根据指定的资源位置定位到具体的资源实例
+        - Spring给出的几个实现类：
+            - DefaultResourceLoader：默认的实现类，逻辑是首先检查资源路径是否以classpath:前缀打着，如果是，则尝试构造ClassPathResource类，否则尝试通过URL来定位资源，如果没有抛出异常，则会构造UrlResource类，否则委派getResourceByPath(String)方法来定位，这个方法的默认逻辑会构造ClassPathResource类并返回
+            - FileSystemResourceLoader：为了避免上述最后一条分支的不恰当处理，可以使用这个实现类，它继承自前者，但覆写了getResourceByPath方法，使之从文件系统加载资源并以FileSystemResource类型返回
+        - ResourcePatternResolver——批量查找的ResourceLoader
+            - 是ResourceLoader的扩展，Loader每次只能根据资源路径返回确定的单个Resource实例，而PatternResolver可以根据指定的资源路径匹配模式返回多个Resource实例
+            - 在继承ResourceLoader的基础上引入了Resource[] getResources(String)方法定义，以支持路径匹配模式，并引入了一种新的协议前缀classpath*:
+            - 最常用的一个实现是PathMatchingResourcePatternResolver，支持ResourceLoader级别的资源加载，支持基于Ant风格的路径匹配模式，支持PatternSolver新增的classpath*:前缀等
+            - 构造上述实现类的实例时，可以指定一个ResourceLoader或使用默认的DefaultResourceLoader，内部会将匹配后确定的资源路径委派给这个ResourceLoader来查找和定位资源
+    3. ApplicationContext与ResourceLoader
+        - ApplicationContext继承了ResourcePatternResolver，即间接实现了ResourceLoader接口，因此它理所应当地支持了统一资源加载
+        - 如果某个bean需要依赖ResourceLoader来查找定位资源，可以通过构造方法或setter为它注入一个ResourceLoader属性，但其实把ApplicationContext自己的引用传进去就能实现一样功能，前文提到的ResourceLoaderAware和ApplicationContextAware接口就可以做到这点
+        - BeanFactory需要注册自定义PropertyEditor来完成String到Resource的类型转换，而ApplicationContext容器可以正确识别Resource类型并转换后注入相关对象，所以直接在\<bean>的value里写URL就行了
+        - ApplicationContext启动时会注册Spring提供的ResourceEditor用于识别Resource类型
+2. 国际化支持
+    - 对于Java中的国际化信息处理，主要涉及两个类：java.util.Locale和java.util.ResourceBundle
+    1. Locale
+        - 不同的Locale代表不同的国家和地区，它们都有相应的ISO标准简写代码表示，如Locale.CHINA，代表表示为zh_CN
+        - 常用的Locale都提供静态常量，不常用的则需要根据相应的国家和地区以及语言来进行构造
+    2. ResourceBundle
+        - 用来保存特定于某个Locale的信息
+        - 通常会管理一组信息序列，它们会有一个统一的basename，比如可以用一组properties文件来分别保存不同国家地区的信息，在命名时让它们有相同的basename（前缀）即可。每个properties文件中都有相同的键来标志具体资源条目，比如menu在中文中叫菜单，在西班牙语叫menudo
+        - 有了ResourceBundle对应的资源文件后，就可以通过ResourceBundle的getBundle(String baseName, Locale locale)方法取得不同Locale对应的ResourceBundle，并根据资源的键取得相应Locale的资源条目内容了
+    - MessageSource与ApplicationContext
+        - Spring在Java SE的国际化支持基础上进一步抽象了国际化信息的访问接口，即MessageSource
+        - 通过这个接口，可以直接传入相应的Locale、资源的键以及相应参数，就可以取得相应信息，而不用先根据Locale取得Resourcebundle再从里面查询信息了
+        - ApplicationContext实现了MessageSource接口，默认情况下它会委派容器中一个bean id为messageSource的MessageSource接口实现来完成其职责，如果找不到这个实现，就自己实例化一个不含任何内容的StaticMessageSource实例，以保证方法调用不出错
+        - Spring提供了有三种MessageSource的实现：
+            - StaticMessageSource：简单实现，可以通过编程的方式添加信息条目，多用于测试，不应该用于正式生产环境
+            - ResourceBundleMessageSource：基于标准Resourcebundle实现，对AbstractMessageSource进行了扩展，提供对多个ResourceBundle的缓存以提高查询速度，对参数化信息和非参数化信息的处理进行了优化，并对用于参数化信息格式化的MessageFormat实例进行缓存，是最常用的生产环境下的实现类
+            - ReloadableResourceBundleMessageSource：基于标准的ResourceBundle实现，可以通过cacheSeconds属性指定时间段，以定期刷新并检查底层的properties资源文件是否有变更，所以使用它的时候尽量避免将信息资源文件放到classpath中。其通过ResourceLoader来加载properties信息资源文件
+        - ApplicationContext启动时会自动识别容器中类型为MessageSourceAware的bean定义，并将自身作为MessageSource注入相应对象实例中
+        - 如果某个对象需要使用MessageSource，可以为其声明一个MessageSource依赖，然后将ApplicationContext中那个mesageSource注入给它
+        - MessageSource可以独立使用，但还让ApplicationContext实现它，是因为在web应用程序中通常会公开ApplicationContext给View层，这样通过tag就可以直接访问国际化信息了
+3. 容器内部事件发布
+    - Spring的ApplicationContext容器提供的容器内事件发布功能是通过提供一套基于Java SE标准自定义事件类而实现的
+    - 自定义事件发布
+        - Java SE提供了实现自定义事件发布功能的基础类，即java.util.EventObject类和EventListener接口，自定义事件类型可以通过扩展前者实现，事件的监听器则扩展自后者
+        - 事件发布者关注的主要有两点：
+            1. 具体时点上自定义事件的发布：为了避免事件处理期间事件监听器的注册或移除操作影响处理过程，需要对事件发布时点的监听器列表进行一个安全复制。事件的发布是顺序执行，监听器的处理逻辑最好简短些，以避免影响性能
+            2. 自定义事件监听器的管理：客户端可以根据情况决定是否需要注册或移除某个事件监听器（通过事件发布类中的注册和移除方法），如果没有提供remove事件监听器的方法，则监听器实例会一直被事件发布者引用，即使已经过期或废弃不用了，也会存在监听器列表中，造成内存泄漏
+    - Spring的容器内事件发布类结构分析
+        - Spring的ApplicationContext容器内部允许以ApplicationEvent的形式发布事件，容器内注册的ApplicationListener类型的bean定义会被ApplicationContext容器自动识别，它们负责监听容器内发布的所有ApplicationEvent类型事件
+        - Application Event
+            - Spring容器内自定义事件类型，继承自EventObject，是一个抽象类，Spring提供了三个实现：
+            1. ContextClosedEvent：容器在即将关闭时发布的事件类型
+            2. ContextRefreshedEvent：容器在初始化或刷新的时候发布的事件类型
+            3. RequestHandledEvent：Web请求处理后发布的事件，其有一子类ServletRequestHandledEvent提供特定于Java EE的Servler相关事件
+        - ApplicationListener
+            - 容器内使用的自定义事件监听器接口定义，继承自EventListener
+            - 容器在启动时会自动识别并加载EventListener类型bean定义，一旦容器内有事件发布，将通知这些注册到容器的EventListener
+        - ApplicationContext
+            - ApplicationContext继承了ApplicationEventPublisher接口，提供了publishEvent方法定义
+            - ApplicationContext在实现事件发布和监听器的注册方面，使用了ApplicationEventMulticaster接口（出于灵活性和扩展性考虑）。SimpleApplicationEventMulticaster是Spring提供的一个子类实现，默认使用SyncTaskExecutor进行事件的发布（同步顺序发布），也可以提供其它类型的TaskExecutor
+            - ApplicationContext在容器启动时会检查容器内是否存在bean id为applicationEventMulticaster的EventMulticaster对象实例，没有的话就默认初始化一个SimpleApplicationEventMulticaster
+    - 容器内事件发布的应用
+        - 主要用于单一容器内的简单消息通知和处理，并不适合分布式、多进程、多容器之间的事件通知
+        - 有事件发布需求的业务类需要拥有ApplicationEventPublisher实例的注入，可以通过实现ApplicationEventPublisherAware接口或ApplicationContextAware接口
+4. 多配置模块加载的简化
+    - BeanFactory也有，只是做得没ApplicationContext好
+    - 通常在实际开发中会将整个系统的配置信息按照某种关注点进行分割并划分到不同的配置文件中，如按照功能模块或按照系统划分层次等
+    - 加载整个系统的bean定义时需要让容器同时读入所有配置文件，BeanFactory要用程序代码一个文件一个文件读，而ApplicationContext可以直接以String[]传入配置文件路径
+    - ClassPathXmlApplicationContext还可以通过指定Classpath中某个类所处位置来加载相应配置文件，比如通过A.class的位置来加载同一目录下的配置文件
