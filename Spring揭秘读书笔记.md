@@ -430,3 +430,91 @@
     - 在扫描类定义并将它们添加到容器时会使用默认的命名规则（小驼峰）来生成beanName，或用@Component("name")的方式自行指定
     - \<context:component-scan>会把AutowiredAnnotationBeanPostProcessor和CommonAnnotationBeanPostProcessor一起注册到容器中（annotation-config属性值默认为true时会做的事情）
     - 也可以让scan功能去扫描前面提到的四个注解以外的其它注解，通过其嵌套配置项include-filter或exclude-filter
+## 第三部分 Spring AOP框架
+### 第7章 一起来看AOP
+- AOP，全程Aspect-Oriented-Programming，中文为面向切面编程
+- 使用AOP可以对类似于Logging和Security等系统需求进行模块化的组织，简化系统需求与实现之间的对比关系，使整个系统的实现更具模块化
+- AOP引入了Aspect的概念，以模块化的形式对系统中的横切关注点（cross-cutting concern）进行封装。Aspect之于AOP，相当于Class之于OOP
+- AOP是一种理念，需要某种语言作为概念实体，实现AOP的语言称为AOL，即Aspect-Oriented Language，其可以与系统实现语言相同，如Java，也可以不同，如扩展自Java的AOL：AspectJ
+- 将AO组件集成到OOP组件的过程，在AOP中称之为织入（Weave）过程
+- 静态AOP时代
+    - 第一代AOP，以AspectJ为代表，特点是相应的横切关注点以Aspect形式实现后，会通过特定的编译器将实现后的Aspect编译并织入系统的静态类中。比如AspectJ会使用ajc编译器将各个Aspect以Java字节码的形式编译到系统的各个功能模块中，以达到整合Aspect和Class的目的
+    - 静态AOP的优点：Aspect直接以Java字节码的形式编译到Java类中，JVM可以像通常一样加载Java类运行，不会对整个系统的运行造成性能损失
+    - 静态AOP的缺点：灵活性不够，如果横切关注点需要改变织入到系统的位置，就需要重新修改Aspect定义文件，然后使用编译器重新编译并重新织入到系统中
+- 动态AOP时代
+    - 第二代AOP，该时代的AOP框架或产品大都通过Java语言提供的各种动态特性来实现Aspect的织入，如JBoss AOP、Spring AOP以及Nanning等AOP框架
+    - AspectJ融合了AspectWerkz框架后，也引入了动态织入行为，从而成为现在Java界唯一一个同时支持静态AOP和动态AOP特性的AOP实现产品
+    - 第二代AOP的AOL大都采用Java实现，各种概念实体全部都是普通的Java类，易于开发和集成
+    - 动态AOP的优点：织入过程在系统运行开始之后进行，而不是预先编译到系统类中，且织入信息大都采用外部XML文件格式保存，可以在调整织入点以及织入逻辑单元的同时不改变系统其他模块，甚至在系统运行时也能动态更改织入逻辑
+    - 动态AOP的缺点：因为其大都在类加载或系统运行期间采用对系统字节码进行操作的方式来完成Aspect到系统的织入，会造成一定的运行时性能损失，但随着JVM版本提升，对反射以及字节码操作技术的更好支持，性能损失在逐渐减少
+- Java平台上的AOP实现机制
+    1. 动态代理
+        - JDK1.3后引入的动态代理机制可以在运行期间为相应的接口动态生成对应的代理对象，因此可以将横切关注点逻辑封装到动态代理的InvocationHandler中，在系统运行期间根据横切关注点需要织入的模块位置将横切逻辑织入到相应的代理类中（即以动态代理类为载体的横切逻辑）
+        - 所有需要织入横切关注点逻辑的模块类都得实现相应的接口，因为动态代理机制只针对接口有效
+        - Spring AOP默认情况下采用这种机制实现AOP功能。Nanning也是，只支持动态代理机制
+    2. 动态字节码增强
+        - JVM加载的class文件都是符合一定规划的，通常的class文件由Java源代码文件使用Javac编译器编译而成，也可以使用ASM或CGLIB等Java工具库，在程序运行期间动态构建字节码的class文件
+        - 在上述前提下，可以为需要织入横切逻辑的模块类在运行期间通过动态字节码增强技术，为这些系统模块类**生成相应的子类**，将横切逻辑加到这些子类中，让应用程序在执行期间使用这些动态生成的子类，从而达到织入的目的
+        - 动态字节码增强技术无需模块类实现相应接口，但如果需要扩展的类以及类中的实例方法等声明为final时，无法对其进行子类化的扩展
+        - Spring AOP在无法采用动态代理机制进行AOP功能扩展时，会使用CGLIB库的动态字节码增强支持来实现AOP的功能扩展
+    3. Java代码生成
+        - EJB容器会根据部署描述符文件提供的织入信息，为相应的功能模块类根据描述符提供的信息生成对应的Java代码，并通过部署工具或部署接口编译Java代码生成相应的Java类
+        - 比较古老的AOP实现，早期EJB容器使用得多，现在已经不用了
+    4. 自定义类加载器
+        - 所有Java程序的class都需要通过相应的类加载器加载到JVM
+        - 可以通过自定义加载器，在加载class文件期间，将外部文件规定的织入规则和必要信息进行读取，并添加到系统模块类的现有逻辑中，将改动后的class交给JVM运行
+        - 这种方式比前面几种都要强大，可以对大部分类以及相应的实例进行织入，但问题在其本身的使用。某些应用服务器会控制整个类加载体系，这种场景下可能会造成问题
+        - JBoss AOP和已经并入AspectJ项目的AspectWerkz框架都是采用自定义类加载器的方式实现
+    5. AOL扩展
+        - 最为强大且最难掌握的一种方式
+        - 需要重新学习一门扩展了旧有语言的AOL或全新的AOL
+        - 具有强类型检查，可以对横切关注点要切入的系统运行时点有更全面的控制
+        - 代价太大，一般懒得搞
+- AOP相关术语
+    1. Joinpoint
+        - 系统运行前，AOP的功能模块需要织入到OOP的功能模块中，因此需要知道在系统的哪些执行点上进行织入，这些点称为Joinpoint
+        - 比较常见的Joinpoint类型：
+            - 方法调用
+            - 方法执行
+            - 构造方法调用
+            - 构造方法执行
+            - 字段设置
+            - 字段获取
+            - 异常处理执行
+            - 类初始化
+    2. Pointcut
+        - 代表的是Joinpoint的表述方式，将横切逻辑织入当前系统的过程中，需要参照Pointcut规定的Joinpoint信息，才知道应该往系统的哪些Joinpoint上织入横切逻辑
+        1. Pointcut的表述方式
+            - 直接指定Joinpoint所在方法名称：功能单一，只限于支持方法级别Joinpoint的AOP框架，通常只限于Joinpoint较少且较为简单的情况
+            - 正则表达式：比较普遍的Pointcut表达方式，可以归纳表述需要符合某种条件的多组Joinpoint，几乎大部分Java平台的AOP产品都支持这种表达形式
+            - 使用特定的Poincut表述语言：强大而灵活，但实现起来复杂，需要设计语言语法，实现相应解释器。AspectJ使用这种方式，其提供了一种类似于正则表达式的表述语言和解释器
+        2. Pointcut运算
+            - Pointcut之间可以进行逻辑运算，可以从简单的Pointcut通过逻辑运行得到最终的复杂Pointcut
+            - 这里的逻辑运算指的是and、or等，如Pointcut.Males || Pointcut.Females
+    3. Advice
+        - Advice是单一横切关注点逻辑的载体，代表将会织入Joinpoint的横切逻辑，如果Aspect相当于OOP中的Class，那Advice就相当于Class中的Method
+        1. Before Advice
+            - 在Joinpoint指定位置之前执行的Advice类型，通常不会中断程序执行流程，如果被织入到方法执行类型的Joinpoint则会先于方法执行
+            - 通常用于做一些系统初始化的工作，如设置初始值，获取必要资源等
+        2. After Advice
+            - 在相应连接点之后执行，可以细分为以下三种
+            1. After returning Advice：只有当前Joinpoint处执行流程正常完成后才会执行，比如方法执行正常返回而没抛异常
+            2. After throwing Advice：又称Throws Advice，只有在当前Joinpoint执行过程中抛出异常的情况下才会执行，比如某个方法执行类型的Joinpoint抛出异常而没有正常返回
+            3. After Advice：不管Joinpoint处执行流程是正常返回还是抛出异常都会执行，就像Java的Finally块一样
+        3. Around Advice
+            - 又名拦截器
+            - 能对附加项目的Joinpoint进行包裹，可以在Joinpoint之前和之后都指定相应的逻辑，甚至于中断或忽略Joinpoint处原来程序流程的执行
+            - 可以完成Before和After Advice的功能，但通常情况下应该让它们各司其职
+            - 应用场景非常广泛，比如J2EE中Servlet规范提供的Filter功能，就是其中一种体现，可以完成类似资源初始化、安全检查之类的横切系统关注点
+        4. Introduction
+            - 在AspectJ中称Inter-Type Declaration，在JBoss AOP中称Mix-in
+            - 与前面几种不同，不是根据横切逻辑在Joinpoint处的执行时机区分，而是根据它可以完成的功能来做区别
+            - 可以为原有的对象添加新的特性或行为
+            - AspectJ采用了静态织入的形式，对象使用时Introduction逻辑已经编译织入完成，理论上性能最好；JBoss AOP或Spring AOP采用动态织入AOP，Introduction性能稍差一些
+    4. Aspect
+        - 是对系统中横切关注点逻辑进行模块化封装的AOP概念实体，可以包含多个PointCut以及相关Advice定义
+    5. 织入和织入器
+        - 织入器负责完成横切关注点逻辑到系统的最终织入
+        - AspectJ有专门的编译器完成织入操作，即ajc；JBoss AOP采用自定义的类加载器完成最终织入；Spring AOP使用一组类完成最终的织入操作，ProxyFactory类则是其中最通用的
+    6. 目标对象
+        - 符合Pointcut所指定的条件，将在织入过程中被织入横切逻辑的对象称为目标对象
