@@ -408,3 +408,25 @@
     - 通常在实际开发中会将整个系统的配置信息按照某种关注点进行分割并划分到不同的配置文件中，如按照功能模块或按照系统划分层次等
     - 加载整个系统的bean定义时需要让容器同时读入所有配置文件，BeanFactory要用程序代码一个文件一个文件读，而ApplicationContext可以直接以String[]传入配置文件路径
     - ClassPathXmlApplicationContext还可以通过指定Classpath中某个类所处位置来加载相应配置文件，比如通过A.class的位置来加载同一目录下的配置文件
+### 第6章 Spring IoC容器之扩展篇
+1. 注解版的自动绑定（@Autowired）
+    - 前面的章节中提到可以用<\bean>的autowire属性来设置自动绑定，但现在可以直接使用@Autowired注解完成一样的功能
+    - @Autowire会按照类型匹配进行依赖注入，与byType类型自动绑定方式类似
+    - @Autowire可以标注于类定义的多个位置：属性、构造方法和其它任意方法
+    - @Autowire的原理是遍历每个bean定义，通过反射检查每个bean定义对应的类上各种可能位置上的@Autowired（属性、函数），存在的话就从当前容器管理的对象中获取符合条件的对象，设置给@Autowired标注的属性或方法
+    - Spring提供的AutowiredAnnotationBeanPostProcessor会在实例化bean定义的过程中做上述事情（别忘了注册这个PostProcessor）
+    - @Qualifier本质上是byName自动绑定的注解版，可以直接点名要注入的bean
+    - @Qualifier可以直接标注在方法入参上，并且能够和@Autowired配合使用
+2. @Autowired之外的选择——使用JSR250标注依赖注入关系
+    - JSR250的@Resource和@PostConstruct以及@PreDestroy对类进行标注也可以达到依赖注入的目的
+    - @Resource与@Autowired的使用方式大致相同，但前者遵循于byName自动绑定形式，而后者是byType
+    - @PostConstruct和@PreDestroy不是服务于依赖注入，主要用于标注对象生命周期管理相关方法，与Spring的InitializingBean和DisposableBean接口以及配置项中的init-method和destroy-method起到类似作用
+    - 使用JSR250的这些注解需要注册CommonAnnotationBeanPostProcessor到容器
+    - 如果使用XSD配置文件，可以直接用\<context:annotation-config>配置将AutowiredAnnotationBeanPostProcessor、CommonAnnotationBeanPostProcessor、PersistenceAnnotationBeanPostProcessor和RequiredAnnotationBeanPostProcessor一并注册到容器中
+3. classpath-scanning功能介绍
+    - classpath-scanning功能可能从某一顶层包（base package）开始扫描，当扫描到某个类标注了相应的注解之后，会提取该类的相关信息，构建对应的BeanDefinition，并注册到容器，就不用一个个添加了
+    - 这个功能只能在XSD形式的配置文件中由\<context:component-scan>启用
+    - \<context:component-scan>默认扫描的注解类型是@Component。在其语义基础上细化的@Repository、@Service和@Controller也同样适用
+    - 在扫描类定义并将它们添加到容器时会使用默认的命名规则（小驼峰）来生成beanName，或用@Component("name")的方式自行指定
+    - \<context:component-scan>会把AutowiredAnnotationBeanPostProcessor和CommonAnnotationBeanPostProcessor一起注册到容器中（annotation-config属性值默认为true时会做的事情）
+    - 也可以让scan功能去扫描前面提到的四个注解以外的其它注解，通过其嵌套配置项include-filter或exclude-filter
