@@ -453,7 +453,7 @@
         - 所有需要织入横切关注点逻辑的模块类都得实现相应的接口，因为动态代理机制只针对接口有效
         - Spring AOP默认情况下采用这种机制实现AOP功能。Nanning也是，只支持动态代理机制
     2. 动态字节码增强
-        - JVM加载的class文件都是符合一定规划的，通常的class文件由Java源代码文件使用Javac编译器编译而成，也可以使用ASM或CGLIB等Java工具库，在程序运行期间动态构建字节码的class文件
+        - JVM加载的class文件都是符合一定规则的，通常的class文件由Java源代码文件使用Javac编译器编译而成，也可以使用ASM或CGLIB等Java工具库，在程序运行期间动态构建字节码的class文件
         - 在上述前提下，可以为需要织入横切逻辑的模块类在运行期间通过动态字节码增强技术，为这些系统模块类**生成相应的子类**，将横切逻辑加到这些子类中，让应用程序在执行期间使用这些动态生成的子类，从而达到织入的目的
         - 动态字节码增强技术无需模块类实现相应接口，但如果需要扩展的类以及类中的实例方法等声明为final时，无法对其进行子类化的扩展
         - Spring AOP在无法采用动态代理机制进行AOP功能扩展时，会使用CGLIB库的动态字节码增强支持来实现AOP的功能扩展
@@ -534,3 +534,67 @@
         - 需要实现net.sf.cglib.proxy.Callback，不过一般会直接使用net.sf.cglib.proxy.MethodInterceptor（扩展了Callback）接口
         - **使用CGLIB的唯一限制是无法对final方法进行覆写**
         - 实现完Callback后需要用CGLIB的Enhancer为目标对象动态地生成一个子类，并将Callback中的横切逻辑附加到该子类中。Enhancer会指定需要生成的子类对应的父类，以及Callback实现
+### 第9章 Spring AOP一世
+1. Spring AOP中的Joinpoint
+    - **Spring AOP中仅支持方法执行类型的Joinpoint**，但对于属性的装载其实可以直接通过对setter和getter方法拦截达到同样的目的
+2. Spring AOP中的Pointcut
+    - Spring中以接口org.springframework.app.Pointcut作为AOP框架中所有Pointcut的最顶层抽象，其定义了两个方法用于捕捉系统中的相应Joinpoint（getClassFilter和getMethodMatcher），并提供了一个TruePointcut类型实例
+    - 如果Pointcut类型为TruePointcut，默认会对系统中的所有对象，以及对象上所有被支持的Joinpoint进行匹配
+    - ClassFilter
+        - ClassFilter接口用于对Joinpoint所处的对象进行Class级别的类型匹配，通过matches()方法。它也包含一个TrueClassFilter类型实例，表示作无差别全匹配
+    - MethodMatcher
+        - MethodMatcher作为Spring主要支持的方法拦截，实现比ClassFilter复杂得多
+        - MethodMatcher中有两个matches()方法，其中一个会检查目标方法的入参列表，另一个不会
+        - MethodMatcher中还有一个isRuntime()方法，在不需要检查入参时，会返回False，称为StaticMethodMatcher，可以在框架内部缓存同样类型的方法匹配结果，因为不用每次都检查入参
+        - isRuntime()返回True时表明每次都会对入参进行匹配检查，称为DynamicMethodMatcher，所以无法对结果进行缓存，效率相对较差。每次匹配时还是会先用不检查入参的matches()方法匹配，如果匹配上了再进一步检查入参
+    - 大部分情况下StaticMethodMatcher可以满足需求，最好避免使用DynamicMethodMatcher
+    - 在MethodMatcher类型的基础上，Pointcut也可以分为StaticMethodMatcherPointcut和DynamicMethodMatcherPointcut两类，因为前者的性能优势，Spring提供了更多支持
+    - 几种常见的Pointcut实现
+        1. NameMatchMethodPointcut
+            - StaticMethodMatcherPointcut的子类
+            - 可以根据自身指定的一组方法名称与Joinpoint所处的方法的方法名称进行匹配
+            - 无法对重载方法进行匹配，因为重载方法名字相同但入参不同，而它只会考虑方法名，不考虑入参
+            - 支持使用通配符“*”进行模糊匹配，亦可使用正则
+        2. JdkRegexpMethodPointcut和Perl5RegexpMethodPointcut
+            - StaticMethodPointcut的子类中有一个专门提供基于正则表达式的实现分支，以抽象类AbstractRegexpMethodPointcut为统帅
+            - 使用这个类时，要注意正则表达式的匹配必须匹配整个方法签名，而不仅仅是方法名（与前一个实现的区别）
+            - Perl5RegexpMethodPointcut使用Jakarta ORO提供正则表达式支持，基于perl5风格的正则表达式
+        3. AnnotationMatchingPointcut
+            - 根据目标对象中是否存在指定类型的注解来匹配Joinpoint
+            - 使用前需要声明相应的注解，包括注解的名字，以及使用的层次（类或方法）
+        4. ComposablePointcut
+            - Spring AOP提供的可以进行逻辑运算的Pointcut实现，可以进行Pointcut之间的“并”和“交”运算
+        5. ControlFlowPointcut
+            - 相较于其它Pointcut，最为特殊，在理解和使用上都麻烦些
+            - 前面介绍的Pointcut指定的方法在调用时一定会织入横切逻辑，而本Pointcut可以指定当方法被具体哪个类调用时才进行拦截
+    - 要实现自定义的Pointcut，通常在StaticMethodMatcherPointcut和DynamicMethodMatcherPointcut两个抽象类的基础上实现相应子类即可
+    - Spring中的Pointcut实现都是普通的Java对象，因此可以通过Spring的IoC容器来注册并使用它们。不过通常在Spring AOP的过程中，不会直接将某个Pointcut注册到容器并公开给容器中的对象使用（后文会详述）
+3. Spring AOP中的Advice
+    - 在Spring中，Advice按照其自身实例能否在目标对象类的所有实例中共享这一标准，可以划分为两大类：per-class类型和per-instance类型
+    - per-class类型的Advice
+        - 该类型的Advice的实例可以在目标对象类的所有实例之间共享，通常只提供方法拦截的功能，不会为目标对象类保存任何状态或添加新的特性
+        1. Before Advice
+            - 最简单的Advice类型，实现的横切逻辑将在相应的Joinpoint之前执行，执行完之后程序会从Joinpoint处继续执行
+            - 不会打断程序的执行流程，但必要时也可以通过抛出相应异常的形式中断程序流程
+            - 使用时实现org.springframework.aop.MethodBeforeAdvice接口即可
+            - 可以用于进行某些资源初始化或其它准备性工作
+        2. ThrowsAdvice
+            - 对应通常AOP概念中的AfterThrowingAdvice
+            - 需要根据将要拦截的Throwable的不同类型在同一个ThrowsAdvice中实现多个afterThrowing方法，框架会使用Java反射机制来调用这些方法
+            - 通常用于对系统中特定的异常情况进行监控，以统一的方式对所发生的异常进行处理，可以在一种名为Fault Barrier的模式中使用
+        3. AfterReturningAdvice
+            - 通过此Advice可以访问到当前Joinpoint的方法返回值、方法、方法参数及所在的目标对象
+            - 只有方法正常返回的情况下才会执行，不适合用于处理资源清理类工作
+            - 不能修改返回值，与通常的AfterReturningAdvice的特性有所出入
+        4. Around Advice
+            - Spring AOP没有提供After Advice以实现finally的功能，但可以通过Around Advice来实现
+            - Spring中没有直接定义其对应的实现接口，而是直接采用了AOP Alliance的标准接口，即org.aopalliance.intercept.MethodInterceptor
+            - 能完成前面几种Advice的功能
+            - 通过invoke方法的MethodInvocation参数可以控制对相应Joinpoint的拦截行为：调用其proceed方法，可以让程序执行继续沿着调用链传播。否则程序执行会在MethodInterceptor处短路，导致Joinpoint上的调用链中断，因此要记得用proceed方法
+    - per-instance类型的Advice
+        - 不会在目标类所有对象实例间共享，而是会为不同的实例对象保存它们各自的状态以及相关逻辑
+        - 在Spring中，Introduction是唯一一种per-instance类型的Advice
+        - Introduction可以在不改动目标类定义的情况下，为目标类添加新的属性以及行为，但必须声明相应的接口以及相应的实现，再通过特定的拦截器将新的接口定义以及实现类中的逻辑附加到目标对象之上
+        - Spring提供了两个现成的实现类：DelegatingIntroductionInterceptor和DelegatePerTargetObjectIntroductionInterceptor
+        - 前者会使用它持有的同一个“delegate”实例供同一目标类的所有实例共享使用，而后者会在内部持有一个目标对象与相应Introduction逻辑实现类之间的映射关系
+        - 与AspectJ直接通过编译器将Introduction织入目标对象不同，Spring AOP采用的是动态代理机制，因此性能要逊色不少
