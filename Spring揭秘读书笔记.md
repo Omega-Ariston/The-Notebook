@@ -598,3 +598,56 @@
         - Spring提供了两个现成的实现类：DelegatingIntroductionInterceptor和DelegatePerTargetObjectIntroductionInterceptor
         - 前者会使用它持有的同一个“delegate”实例供同一目标类的所有实例共享使用，而后者会在内部持有一个目标对象与相应Introduction逻辑实现类之间的映射关系
         - 与AspectJ直接通过编译器将Introduction织入目标对象不同，Spring AOP采用的是动态代理机制，因此性能要逊色不少
+4. Spring AOP中的Aspect
+    - Advisor代表Spring中的Aspect，用于封装Pointcut和Advice
+    - Advisor通常只持有一个Pointcut和一个Advice，而理论上Aspect定义中可以有多个Pointcut和多个Advice
+    - Advisor可以简单划分为两个分支：
+        1. PointcutAdvisor家族
+            - 大部分Advisor实现都是PointAdvisor的子类
+            1. DefaultPointcutAdvisor
+                - 最通用的PointcutAdvisor实现，除了Introduction之外剩下的任何类型的Pointcut和Advice都可以通过其来使用
+            2. NameMatchMethodPointcutAdvisor
+                - 前一种Advisor的细化实现，限定了自身可以使用的Pointcut类型为NameMatchMethodPointcut，且外部不可更改，可以使用除了Introduction外的所有Advice
+                - 内部持有一个NameMatchMethodPointcut类型的Pointcut实例
+            3. RegexpMethodPointcutAdvisor
+                - 也限定了自身使用的Pointcut类型，即只能通过正则表达式设置
+                - 内部持有一个AbstractRegexpMethodPointcut的实例
+            4. DefaultBeanFactoryPointcutAdvisor
+                - 使用得比较少，因为自身绑定到了BeanFactory，因此应用也要绑定到Spring的IoC容器
+                - 可以通过容器中的Advice注册的beanName来关联对应的Advice
+                - 当对应的Pointcut匹配成功之后，才去实例化对应的Advice，减少容器启动初期Advisor和Advice之间的耦合性
+        2. IntroductionAdvisor分支
+            - 与前一种Advisor最本质的区别是其只能应用于类级别的拦截，只能使用Introduction型的Advice
+            - 只有一个默认实现DefaultIntroductionAdvisor
+            - 只可以指定Introduction型的Advice（IntroductionInterceptor）以及将被拦截的接口类型
+    - Ordered的作用
+        - 大多数时候系统中都会有多个横切关注点需要处理，那么系统实现中就会有多个Advisor存在。当其中某些Advisor的Pointcut匹配了同一个Joinpoint的时候，就会在同一个Joinpoint处执行多个Advice的横切逻辑
+        - 默认情况下Advice的处理顺序由它们在Spring配置中的声明顺序决定
+        - 可以通过让相应的Advisor以及其他顺序紧要的bean实现org.springframework.core.Ordered接口来明确指定相应顺序号
+5. Spring AOP的织入
+    - ProxyFactory
+        - Spring AOP中使用org.springframeworkaop.framework.ProxyFactory作为织入器（非唯一可用，仅为最基本）
+        - 使用ProxyFactory需要指定对其进行织入的目标对象以及将要应用到目标对象的Aspect（Advisor）
+        - 基于接口的代理：可以用ProxyFactory.setInterfaces方法明确指定具体的接口类型，或直接让它按照面向接口进行代理（不将optimize和proxyTargetClass两个属性值设置为true）
+        - 基于类的代理：目标类没有实现任何接口时，ProxyFactory会用CGLIB做基于类的代理。如果实现了接口也想用这个方式，需要将optimize或proxyTargetClass属性设置为true
+        - Spring AOP框架内使用AopProxy对不同的代理实现机制进行了适度的抽象，提供相应的AopProxy子类实现，目前提供了针对JDK的动态代理和CGLIB两种机制的实现
+    - ProxyFactoryBean
+        - 使用ProxyFactory可以独立于Spring的IoC容器外使用Spring的AOP，但将Spring AOP与IoC容器结合才能发挥更大作用，比如在容器中对Pointcut和Advice等进行管理
+        - 在IoC容器中使用ProxyFactoryBean作为织入器，使用上与ProxyFactory无太大区别
+    - Spring AOP给出了自动代理机制，用以解决使用ProxyFactoryBean配置工作量较大的的问题，其原理是使用ApplicationContext容器（BeanFactory也可以支持但很麻烦）的BeanPostProcessor，在对象实例化时为其生成代理对象并返回，而不是实例化后的目标对象本身，从而达到代理对象自动生成的目的
+    - Spring AOP实现的自动代理实现类：
+        - BeanNameAutoProxyCreator：可以通过指定一组容器内的目标对象对应的beanName，将指定的一组拦截器应用到这些目标对象之上
+        - DefaultAdvisorAutoProxyCreator：注册到容器后，它会自动搜寻容器内的所有Advisor，并根据各个Advisor提供的拦截信息，为符合条件的容器中的目标对象生成相应的代理对象。使用后容器中取得的对象实例就都是代理后包含了织入逻辑的代理对象了，除非该对象不符合Pointcut规定的拦截条件
+6. TargetSource
+    - 通常在使用ProxyFactory和ProxyFactoryBean时，会通过setTarget()方法指定具体的目标对象，ProxyFactoryBean还可以通过setTargetName()指定目标对象在IoC容器中的bean定义名称，除此之外还可以通过setTargetSource()来指定目标对象
+    - TargetSource作用类似于对目标对象加壳，或相当于目标对象的容器
+    - 通常情况下无论是通过setTarget()还是setTargetName()等方法设置的目标对象，框架内部都会通过一个TargetSource实现类对这个设置的目标对象进行封装，即以统一的方式处理调用链终点的目标对象
+    - TargetSource的主要特性：每次的方法调用都会触发TargetSource的getTarget()方法，会从相应的TargetSource实现类中取得具体的目标对象，以此控制每次方法调用作用到的具体对象实例
+    - 可以提供一个目标对象池，每次从TargetSource取得的目标对象都从这个目标对象池中取得。一个TargetSource实现类可以持有多个目标对象实例，然后按照某种规则在每次方法调用时返回相应的目标对象实例
+    - 也可以让TargetSource只持有一个目标对象实例，每次的方法调用就都会针对这一个目标对象实例（ProxyFactory/ProxyFactoryBean的处理方式）
+    - 现成的TargetSource实现类：
+        1. SingletonTargetSource：使用最多的TargetSource实现类，内部只持有一个目标对象，每次方法调用到达时，都会返回这同一个目标对象
+        2. PrototypeTargetSource：与前一个目标不同，每次方法调用到达时，都会返回一个新的目标对象实例供调用（目标对象的bean定义声明的scope必须为prototype）
+        3. HotSwappableTargetSource：可以在应用程序运行时根据某种特定条件动态替换目标对象类的具体实现
+        4. CommonsPoolTargetSource：以对象池的方式提供有限数目的目标对象实例
+        5. ThreadLocalTargetSource：如果想为不同的线程调用提供不同的目标对象，用这个可以保证各自线程上对目标对象的调用可以被分配到当前线程对应的目标对象实例上。其本质是对JDK标准的ThreadLocal进行了简单封装
