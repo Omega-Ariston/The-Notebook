@@ -651,3 +651,57 @@
         3. HotSwappableTargetSource：可以在应用程序运行时根据某种特定条件动态替换目标对象类的具体实现
         4. CommonsPoolTargetSource：以对象池的方式提供有限数目的目标对象实例
         5. ThreadLocalTargetSource：如果想为不同的线程调用提供不同的目标对象，用这个可以保证各自线程上对目标对象的调用可以被分配到当前线程对应的目标对象实例上。其本质是对JDK标准的ThreadLocal进行了简单封装
+### 第10章 Spring AOP二世
+1. @AspectJ形式的Spring AOP
+    - @AspectJ代表了一种定义Aspect的风格，能够以POJO的形式定义Aspect，没有其他接口定义限制，只需要使用相应的注解标注这些Aspect定义的POJO类，Spring AOP会根据标注的注解搜索这些Aspect定义类，将其织入系统
+    - Aspect中可以定义多个Pointcut以及多个Advice，因此除了要使用@Aspect标注Aspect类之外，还需要通过名为@Pointcut的注解指定Pointcut定义，通过@Around等注解来指定哪些方法定义了相应的Advice逻辑
+    - 有两种方式将Aspect定义织入这个目标对象类，实现对其符合Pointcut定义的Joinpoint进行拦截：
+        1. 编程方式织入：通过AspectJProxyFactory实现，使用上与ProxyFactory没有多大区别，但多了addAspect()方法，可以直接为AspectJProxyFactory添加相应的Aspect定义。也可以当作ProxyFactory来用
+        2. 通过自动代理织入：AnnotationAwareAspectJAutoProxyCreator，是针对@AspectJ风格的AOP提供的AutoProxyCreator自动代理实现类，只需在IoC容器的配置文件中注册一下即可，它会自动搜集IoC容器中注册的Aspect，并应用到Ponitcut定义的各个目标对象上
+    - @AspectJ形式的Pointcut
+        - 包含两个部分：
+            1. Pointcut Expression：规定Pointcut匹配规则的地方，载体为@Pointcut，该注解是方法级别的注解。Pointcut表达式由Pointcut标志符（表明行为）和表达式匹配模式组成。被附着的方法被称为Point Signature
+            2. Pointcut Signature：Pointcut Signature所在的方法定义，返回类型必须是void。方法上的修饰符如public、private，也会影响到Pointcut Signature的被引用范围
+            - Pointcut Expression支持&&、||、以及!逻辑运算符
+        - Pointcut表达式标志符
+            - execution：使用最多的标志符（Spring AOP仅支持方法执行类型的Joinpoint），能匹配拥有指定方法签名的Joinpoint。方法名及入参、返回类型必须指定，亦可使用通配符进行模糊匹配
+            - within：只接受类型声明，会匹配指定类型下所有Joinpoint，但因为Spring AOP只支持方法级别，within实际上是匹配指定类所声明的所有方法执行。也支持通配符
+            - this和target：AspectJ中，前者指代调用方法一方所在的对象，target指代被调用方法所在的对象（**但在Spring AOP中有所不同，this指代目标对象的代理对象，target指代目标对象**）。通常都是与其他标志符结合使用以进一步加强匹配的限定规则
+            - args：能捕捉拥有指定参数类型、指定参数数量的方法级Joinpoint，无视方法所在的类
+            - @within：对象标注了该类型的注解后，使用了@within标志符的Pointcut表达式将匹配该对象内部所有Joinpoint
+            - @target：目标对象拥有@target标志符所指定的注解类型时，其内部所有方法级别Joinpoint将被匹配。对Spring而言@within和@target的区别在于前者属于静态匹配，后者属于运行时点动态匹配Joinpoint
+            - @args：使用此标志的Pointcut表达式将会尝试检查当前方法级Joinpoint的方法参数类型，如果参数类型拥有@args所指定的注解，则匹配当前Joinpoint
+            - @annotation：使用此标志的Pointcut表达式将会尝试检查系统中所有对象的所有方法级别Joinpoint，当被检测的方法标注有@annotation标志符所指定的注解类型，则当前方法所在的Joinpoint将被Pointcut表达式所匹配
+            - 所有以@开头的标志符都只能指定注解类型参数
+        - @AspectJ形式的Pointcut在Spring AOP中的真面目
+            - 实际上@AspectJ形式声明的所有Pointcut表达式在Spring AOP内部都会通过解析转化为具体的Pointcut对象
+            - AspectJExpressionPointcut类代表Spring AOP中面向AspectJ的Pointcut具体实现，其内部持有通过反射获得的Pointcut表达式
+    - @AspectJ形式的Advice
+        - 实际上是使用@Aspect标注的Aspect定义类中的普通方法，但它们需要针对不同的Advice类型使用对应的注解进行标注：
+            - @Before：用于标注Before Advice定义所在的方法
+            - @AfterReturning：用于标注After Returning Advice定义所在的方法
+            - @AfterThrowing：用于标注After Throwing Advice定义所在的方法
+            - @After：用于标注After Advice定义所在的方法
+            - @Around：用于标注Around Advice定义所在的方法
+            - @DeclareParents：用于标注Introduction类型的Advice，但该注解对应标注对象的域，而不是方法
+        - 各种Advice最终织入到什么位置，是由相应的Pointcut定义决定的，这里可以直接引用现有的Pointcut Signature，也可以自己写一个Pointcut表达式
+        - 可以通过参数绑定的方式让上述注解获得方法入参、异常信息、返回值等信息
+    - Advice的执行顺序（引用的Pointcut定义恰好匹配同一个Joinpoint时）
+        - 当Advice声明在同一Aspect内时，由声明顺序决定，先声明的拥有高优先级。对于Before Aspect，优先级高的先运行，而对于AfterReturningAdvice，优先级高的后运行
+        - 当Advice声明在不同Aspect内时，需要使用Spring的org.springframework.core.Ordered接口来指定顺序，否则顺序是不确定的
+    - 对于注册到容器的各个Aspect，默认以singleton方式进行实例化
+2. 基于Schema的AOP
+    - 是Spring2.0后新增的一种AOP使用方式，可以从如下两个角度来看待：
+        1. 配置方式的改变：提倡的容器配置方式从基于DTD的XML转向基于Schema的XML，进一步提高了配置方式的灵活性和可扩展性，亦为Spring的AOP功能提供了独有的命名空间
+        2. @AspectJ形式AOP的折中：不使用注解的前提下依然可以使用基于POJO的Aspect声明方式（适合Java5之前的版本 = =）
+    - 基于Schema的AOP配置概览
+        - 针对Pointcut、Advisor以及Aspect等概念提供了独立的配置元素，包含在统一的配置元素\<aop:config>中，其只有一个属性proxy-target-class，对应ProxyConfig中的proxyTargetClass属性，用于控制使用基于接口或基本类的代理
+        - \<aop:config>内部可以有三个子元素：\<aop:pointcut>、\<aop:advisor>和\<aop:aspect>，必须按照顺序配置
+        - 同一个配置文件中可以配置多个\<aop:config>，每个子元素可以有多个相同的并列元素
+    - 向基于Schema的AOP迁移
+        - 具体而言，使用\<aop:advisor>替代各种具体的Advisor实现类的bean定义声明，使用\<aop:config>取代各种AutoProxyCreator
+        - \<aop:advisor>的属性包括：id、pointcut-ref、advicece-ref和order，名字自解释，基本与一个Advisor bean定义对等
+    - 从@AspectJ到基于Schema的AOP迁移
+        - 基于Schema的Aspect声明由两部分组成：Aspect的定义（依然由POJO完成）和Aspect到容器的配置（像通常的bean定义一样注册到容器后，通过\<aop:aspect>来引用）
+        - 基于Schema的Pointcut声明可以位于两个位置：直接声明到\<aop:config>下面（可以在其余的Advisor定义和Aspect定义中共享引用），或声明在\<aop:aspect>元素内部（只能在其所声明的aspect内部使用，相当于private定义）
+        - 基于Schema的Advice声明也分为两部分：Advice的定义（即Aspect定义类中的一个个方法定义）和Advice到容器的配置
