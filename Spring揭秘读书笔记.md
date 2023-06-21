@@ -700,8 +700,20 @@
         - 同一个配置文件中可以配置多个\<aop:config>，每个子元素可以有多个相同的并列元素
     - 向基于Schema的AOP迁移
         - 具体而言，使用\<aop:advisor>替代各种具体的Advisor实现类的bean定义声明，使用\<aop:config>取代各种AutoProxyCreator
-        - \<aop:advisor>的属性包括：id、pointcut-ref、advicece-ref和order，名字自解释，基本与一个Advisor bean定义对等
+        - \<aop:advisor>的属性包括：id、pointcut-ref、advice-ref和order，名字自解释，基本与一个Advisor bean定义对等
     - 从@AspectJ到基于Schema的AOP迁移
         - 基于Schema的Aspect声明由两部分组成：Aspect的定义（依然由POJO完成）和Aspect到容器的配置（像通常的bean定义一样注册到容器后，通过\<aop:aspect>来引用）
         - 基于Schema的Pointcut声明可以位于两个位置：直接声明到\<aop:config>下面（可以在其余的Advisor定义和Aspect定义中共享引用），或声明在\<aop:aspect>元素内部（只能在其所声明的aspect内部使用，相当于private定义）
         - 基于Schema的Advice声明也分为两部分：Advice的定义（即Aspect定义类中的一个个方法定义）和Advice到容器的配置
+### 第11章 AOP应用案例
+- 常见的无非是用ThrowsAdvice完成Fault Barrier异常处理、用方法拦截器做安全检查、用Aspect封装实现缓存
+
+### 第12章 Spring AOP之扩展篇
+- 这章举了一个方法拦截不生效的场景，大意是想说明，当代理对象的方法执行经历了拦截器之后，最终会将调用转向目标对象上的对应方法，之后的调用流程都在目标对象上进行，如果这个方法中又调用了其它方法，那么其它方法上的拦截器将会不生效，因为针对其它方法的横切逻辑在代理对象上，而不在目标对象上
+- 解决的思路是为目标对象注入依赖对象的代理对象。在这个场景下目标对象依赖于自身，那可以尝试将目标对象的代理对象公开给它，让目标对象调用自身代理对象上的相应方法，以解决内部调用的方法没有被拦截的问题
+- Spring AOP提供了AopContext来公开当前目标对象的代理对象，只要在目标对象中使用AopContext.currentProxy()就可以取得当前目标对象所对应的代理对象，所以只要重构目标对象，让它直接调用它的代理对象的相应方法即可
+- 除了上述的注入方式外，还可以通过以下方式：
+    - 在目标对象中声明一个实例变量作为其代理对象的引用，由构造方法或setter进行注入，将AopContext.currentProxy()取得的Object注入这个实例变量
+    - 在目标对象中声明一个getter方法，如getThis()，通过Spring的IoC容器的方法注入或方法替换，将方法逻辑替换为return AopContext.currentProxy()。调用时直接通过getThis.method()即可
+    - 声明一个Wrapper类，让目标对象依赖于这个类。在Wrapper类中直接声明一个getProxy()或类似的方法，将return AopContext.currentProxy()类似逻辑添加到这个方法中，目标对象通过getWrapper().getProxy()取得相应的代理对象。Wrapper类可以分离目标对象与Spring API的直接耦合
+    - 为类似的目标对象声明统一的接口定义，通过BeanPostProcessor处理这些接口实现类，将实现类的某个取得当前对象的代理对象的方法逻辑覆盖掉。与方法替换的原理一样，但可以借助Spring IoC容器进行批量处理
