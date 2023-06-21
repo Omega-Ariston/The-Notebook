@@ -717,3 +717,36 @@
     - 在目标对象中声明一个getter方法，如getThis()，通过Spring的IoC容器的方法注入或方法替换，将方法逻辑替换为return AopContext.currentProxy()。调用时直接通过getThis.method()即可
     - 声明一个Wrapper类，让目标对象依赖于这个类。在Wrapper类中直接声明一个getProxy()或类似的方法，将return AopContext.currentProxy()类似逻辑添加到这个方法中，目标对象通过getWrapper().getProxy()取得相应的代理对象。Wrapper类可以分离目标对象与Spring API的直接耦合
     - 为类似的目标对象声明统一的接口定义，通过BeanPostProcessor处理这些接口实现类，将实现类的某个取得当前对象的代理对象的方法逻辑覆盖掉。与方法替换的原理一样，但可以借助Spring IoC容器进行批量处理
+## 第四部分 使用Spring访问数据
+### 第13章 统一的数据访问异常层次体系
+1. DAO模式的背景
+    - 为了统一和简化相关的数据访问操作，J2EE核心模式提出了DAO（Data Access Object）模式，可以完全分离数据的访问和存储，屏蔽各种数据访问方式的差异性（普通文本、csv文件、关系数据库RDBMS、轻量级目录访问协议LDAP等）
+    - 对于客户端代码来说，如通常的服务层代码，只需要声明依赖该数据访问接口即可，所有的数据访问全部通过该接口进行。即使以后因为数据存储机制发生变化而导致DAO接口的实现类发生变化，客户端代码也不需要做任何调整（除非设计太差）
+    - 当数据访问接口的实现类发生变化时，客户端可以完全忽视这种变化，唯一需要变动的地方可能只是Factory对象的几行代码，甚至只是IoC容器配置文件中简单的class类型替换而已
+2. 梦想照进现实
+    - 上述概念是比较理想化的情况，现实中会有其它需要考虑的细节，比如当引入数据访问机制特定的代码时，比如异常处理，就会出现问题：
+    - 问题1：
+        - 使用JDBC进行数据访问时，出现问题会抛出SqlException，其属于checked exception，DAO实现类需要捕获这种异常并进行处理
+        - 直接在DAO中处理，客户端会无法得知异常的发生。直接向上层抛出异常，则需要相应地修改方法签名
+    - 问题2：
+        - 在引入其它数据访问机制时，比如当加入LdapCustomerDao实现时，其需要抛出NamingException，如果按照上面的方式修改，则需要在方法签名中新增NamingException的抛出
+        - 随着不同数据访问对象实现的增多，以及考虑数据访问对象中其他数据访问方法，问题会越来越多
+3. 发现问题，解决问题
+    - 几乎所有数据访问操作抛出的异常对于客户端来说是系统的Fault，客户端是无法有效处理的，比如数据库操作失败、无法取得相应资源等，客户端最有效的处理方式是不处理。所以将SQLException以及其他特定于数据访问机制的异常，以unchecked exception进行封装并抛出，是比较合适的
+    - 现在可以去掉方法签名上那一长串异常抛出了
+    - 以RuntimeException形式将特定的数据访问异常转换后抛出，虽然解决了统一数据访问接口的问题，但依然不够周全，比如各个数据库提供商通过SQLException表达具体的错误信息时，采用的方式是不同的，有的用ErrorCode作为具体错误信息标准，有的用SqlState返回详细的错误信息。这么一来，客户端还是需要根据不同提供商采取不同的信息提取方式，无法做到差异性的屏蔽
+    - 解决上述问题的方式是异常的分类转译：
+        - 首先，不应该将对特定的数据访问异常的错误信息提取工作留给客户端对象，而是应该由DAO实现类或某个工具类以统一的方式进行处理
+        - 信息提取出来后，只通过RuntimeException一个异常类型，还不足以区分不同的错误类型，需要将数据访问期间发生的错误进行分类，并分配对应的异常类型（RuntimeException的自定义子类，一般类名可自解释）
+        - 如此一来，不管采用什么数据库服务器或数据访问方式，只要将它们自身的异常通过某种方式转译为客户端熟悉的几种异常类型，客户端就只需要关注这几种类型的异常，其处理逻辑便可岿然不动了
+4. 不重新发明轮子
+    - Spring框架中统一的异常层次体系所涉及的大部分异常类型都定义在org.springframework.dao包中，它们均以org.springframework.dao.DataAccessException为统领，并根据职能划分为不同的异常子类型：
+    - CleanupFailureDataAccessException：当已经成功完成相应的数据访问操作，要对使用的资源进行清理却失败时抛出，如关闭数据库连接过程中出现SQLException
+    - DataAccessResourceFailureException：在无法访问相应的数据资源的情况下抛出，如数据库服务器挂掉
+    - DataSourceLookupFailureException：当尝试对JNDI（Java命名和目录接口）服务上或者其他位置上的DataSource进行查找，而查找失败时抛出
+    - ConcurrencyFailureException：当并发进行数据访问操作失败时抛出，如无法取得相应的数据库锁或乐观锁更新冲突等。下面还细分了多个子类型
+    - InvalidDataAccessApiUsageException：以错误的方式使用了特定的数据访问API时抛出，如使用Spring的JdbcTemplate的getForObject()方法进行查询操作，而传入的SQL查询却返回多行结果（其语义上只返回一个结果对象）
+    - InvalidDataAccessResourceUsageException：以错误的方式访问数据资源时抛出，比如访问数据库资源时传入错误的SQL。下面还细分了多个子类型
+    - DataRetrievalFailureException：在要获取预期的数据却失败时抛出，比如已知某顾客存在，却根据顾客号获取顾客信息失败
+    - PermissionDeniedDataAccessException：尝试访问某些数据，而自身却没有相应权限时抛出
+    - DataIntegrityViolationException：数据一致性冲突异常，当尝试更新数据却违反了数据一致性检查的情况下抛出，比如数据库中已经存在主键为1的记录，却又插入同样主键记录时
