@@ -750,8 +750,69 @@
     - DataRetrievalFailureException：在要获取预期的数据却失败时抛出，比如已知某顾客存在，却根据顾客号获取顾客信息失败
     - PermissionDeniedDataAccessException：尝试访问某些数据，而自身却没有相应权限时抛出
     - DataIntegrityViolationException：数据一致性冲突异常，当尝试更新数据却违反了数据一致性检查的情况下抛出，比如数据库中已经存在主键为1的记录，却又插入同样主键记录时
-### 第14章-第16章
-- 这部分内容有的有些过时，有的过于实践，等我有需要或积攒一些经验了再回来看
+### 第14章 JDBC API的最佳实践
+1. 基于Template的JDBC使用方式
+    1. JDBC的尴尬
+        - JDBC：Java平台访问关系数据库的标准API
+        - JDBC的缺陷：由于其主要面向较为底层的数据库操作，在设计时也比较贴近底层以提供尽可能多的功能特色，以致于即使执行简单的查询或更新也需要按照API的规矩写上大堆雷同的代码（比如获取和释放Connection）
+        - SQLException的痛点：没有将具体的异常情况子类化，而是采用ErrorCode的方式来区分数据访问过程中出现的不同异常情况，并且将ErrorCode的规范制定留给了各个数据库提供商，导致不同的提供商提供的数据库对应不同的ErrorCode，在异常处理时需要根据使用的数据库进行异常判断
+    2. JdbcTemplate的诞生
+        - JdbcTemplate是整个Spring数据抽象层提供的所有JDBC API最佳实践的基础，框架内其他更加方便的Helper类以及更高层次的抽象都构建于其上
+        - JdbcTemplate主要关注如下两个事情：
+            1. 封装所有基于JDBC的数据访问代码，以统一的格式和规范来使用JDBC API
+            2. 对SQLException所提供的异常信息在框架内进行统一转译，将基于JDBC的数据访问异常纳入Spring自身的异常层次体系中，统一了数据接口的定义
+        - JdbcTemplate主要通过模板方法模式对基于JDBC的数据访问代码进行统一封装
+        - 模板方法模式：主要用于对算法或行为逻辑进行封装，即如果多个类中存在某些相似的算法逻辑或行为逻辑，可以将这些相似的逻辑提取到模板方法类中实现，并让相应的子类根据需要实现某些自定义的逻辑
+        - 使用DataSourceUtils进行Connection的管理：与直接从DataSource取得Connection不同，DataSourceUtils会将取得的Connection绑定到当前线程，以便在使用Spring提供的统一事务抽象层进行抽象管理时使用
+        - 使用NativeJdbcExtractor来获得真相：JdbcTemplate内部定义了一个NativeJdbcExtractor类型的实例变量，可以通过setter方法设置相应的实现类，可用于剥离相应的代理对象取得真正的目标对象（如果需要获得数据库驱动程序提供的原始Connection实现类以使用特定于数据库的特色功能）
+    3. JdbcTemplate和它的兄弟们
+        - JdbcTemplate用于查询的回调接口定义主要有有三种：
+            1. ResultSetExtractor：重写方法以集合形式返回多行数据，调用者需要在ResultSet上进行遍历以取得信息
+            2. RowMapper：重写方法只定义单个数据的返回逻辑，调用者无需遍历
+            3. RowCallbackHandler：重写方法以单行形式定义数据获取方式，但不返回数据，用户可以直接在方法中定义对每行数据的操作
+        - 批量更新数据：JdbcTemplate提供了两个重载的batchUpdate方法支持批量更新操作，它们会先检查使用的JDBC驱动程序是否支持批量更新功能，若不支持则单独执行每一笔更新操作
+        - 存储过程：是定义于数据库服务器端的计算单元，所有计算全部在服务器端完成，可以避免像客户端计算一样在网络间来回传送数据导致性能损失
+        - 递增主键生成策略的抽象
+            - 为关系型数据库增加数据时，新增数据的主键生成通常有两种选择：
+                1. 在数据库服务器端使用不同的数据库厂商提供的主键生成策略支持（可以充分利用数据库的特性及优化措施，但可移植性比较差，某些情况下可能造成数据库过多负担）
+                2. 在应用程序的客户端根据算法生成需要的数据主键（可以分担服务器负担，且生成策略可以根据情况进行调整，性能可能随着系统架构不同而有所提升）
+            - Spring对递增的主键生成策略进行了适当的抽象，针对不同的关系数据库给出了相应的主键生成实现类（位于org.springframework.jdbc.support.incrementer包下，顶层接口定义为DataFieldMaxValueIncrementer）
+            - 根据不同数据库对递增主键生成的支持，DateFieldMaxValueIncrementer的实现类可以分为如下两类：
+                1. 基于独立主键表的DataFieldMaxValueIncrementer
+                    - 依赖于为每一个数据表单独定义的**主键表**，其中定义的主键可以根据需要获取并递增，且可以设置每次获取的CacheSize以减少对数据库资源的访问频度（Spring为HSQLDB和MySQL数据库提供的策略）
+                    - 需要为相应的表定义对应的主键表，以保存相应的主键值
+                    - 为了减少事务开销，将主键表引擎设置为MYISAM，而不是InnoDB
+                    - 在插入数据时可以通过MaxValueIncrementer获取主键，但需要为其提供一个DataSource及相应的主键表名
+                2. 基于数据库Sequence的DataFieldMaxValueIncrementer
+                    - Spring为类似DB2、Oracle和PostgreSQL这种本身支持基于Sequence主键生成的数据库提供的实现类
+                    - 需要在数据库中定义相应的Sequence，并在构造MaxValueIncrementer时告知对应的Sequence名称
+                    - Cache大小需要在数据库的Sequence定义中指定
+        - Spring中的LOB类型处理
+            - LOB：数据库中能够存取大量数据的数据类型，按照存放的具体数据形式，一般分为BLOB（二进制大对象）和CLOB（文本大对象）两种类型
+            - Spring提出了一套LOB数据处理类用于屏蔽各数据库驱动在处理LOB数据方式上的差异性（核心是LobHandler接口）
+        - NamedParameterJdbcTemplate
+            - 本质上是对JdbcTemplate的上层封装，允许用户使用MapSqlParameterSource来对参数进行命名（通过内部持有的Map实例实现）
+        - SimpleJdbcTemplate
+            - 集合了JdbcTemplate和NamedParameterJdbcTemplate的功能于一身（内部持有NamedParameterJdbcTemplate的实例）
+            - 可以使用动态参数的形式取代Object[]参数形式，并能利用JDK的自动拆装箱功能避免原始类型到封装类型的转换，也可以声明强类型的返回值类型，而不是仅为Object
+    4. Spring中的DataSource
+        1. DataSource的种类
+            - DataSource的基本角色是ConnectionFactory，所有的数据库连接将通过DataSource接口统一管理，其实现类根据功能强弱可以分为以下三类：
+            1. 简单的DataSource实现：通常只提供作为ConnectionFactory角色的基本功能，用于开发或测试而非生产（每次请求连接时返回新的数据库连接或使用同一个连接，没有缓冲池功能）
+            2. 拥有连接缓冲池的DataSource实现：内部会通过连接缓冲池对数据库连接进行管理，用于生产环境。在系统启动之初就初始化一定数量的数据库连接以备用，调用close()方法关闭Connection对象时实际只是返回给连接池
+            3. 支持分布式事务的DataSource实现：XADataSource的实现类，同样支持数据库连接的缓冲，通常只有比较重量级的应用服务器会提供支持分布式事务的DataSource
+         2. DataSource的访问方式
+            - 本地DataSource访问：最常用的方式，在当前应用程序的上下文中构造并持有相应的DataSource实现。只要将相应的DataSource实现类所在jar包加入应用程序ClassPath便可构造及访问
+            - 远程DataSource访问：对于各种应用服务器提供的特有的DataSource实现，或绑定到应用服务器命名服务的独立的DataSource实现，需要通过JNDI对其进行访问
+        3. 自定义DataSource的实现
+            - 如果应用程序有多个数据库且需要根据情况让应用程序访问不同数据库时，可以扩展并实现AbstractRoutingDataSource
+            - 如果需要为现有DataSource添加新行为，可以扩展DelegatingDataSource，其内部持有其它的DataSource实例作为目标对象，自身可以在转发方法调用之前添加自定义逻辑（类似AOP），比如为现有DataSource加入验证信息（UserCredentialsDataSourceAdapter）或对Connection进行事务管理(TransactionAwareDataSourceProxy)
+2. 基于操作对象的JDBC使用方式
+    - 查询、更新、调用存储过程等数据访问操作被抽象为操作对象。RdbmsOperation作为整个操作对象体系的顶层抽象定义
+    - 所有操作对象最终的数据访问都是通过JdbcTemplate进行，二者只是对待概念的视角上有所不同，底层JDBC使用方式还是一样的
+    - 根据数据访问操作，RdbmsOperation分为三个主要分支：查询操作对象分支（SqlQuery）、更新操作对象分支（SqlUpdate）、存储过程对象分支（StoredProcedure）
+### 第15章-第16章
+- 这部分内容过于实践，等我有需要或积攒一些经验了再回来看
 ## 第五部分 事务管理
 ### 第17章 有关事务的楔子
 1. 认识事务本身
@@ -775,3 +836,6 @@
         1. 全局事务：如果整个事务处理过程中有多个RM参与，就需要引入TPM来协调多个RM之间的事务处理。TPM会采用两阶段提交协议来保证ACID。所有应用程序提交的事务请求都需要通过TPM的调配后直接由TM统一协调，TM将使用两阶段提交协议来协调多RM间的事务处理
         2. 局部事务：如果当前事务只有一个RM参与其中，比如只对一个数据库更新，或只向一个消息队列发送消息的情况，都属于局部事务。不用引入相应的TPM来协调多个RM的事务处理，应用程序可以直接与RM打交道。通常情况下相应的RM都有内置的事务支持（更倾向使用）
     - 局部事务与全局事务的主要区分在于事务涉及的RM数，而不是系统中实际的RM数
+### 第18章 群雄逐鹿下的Java事务管理
+- 这章的内容有点过时了
+### 第19章 
