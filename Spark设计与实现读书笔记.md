@@ -106,7 +106,7 @@
             2. RDD可以包含多个数据分区，不同数据分区可以由不同的任务在不同节点进行处理。
     3. 数据操作：
         - 定义了数据模型后，可以对RDD进行各种数据操作，Spark将这些数据操作分为两种：transformation()和action()。两者的区别是后者一般是对数据结果进行后处理(post-processing)，产生输出结果，并触发Spark提交job真正执行数据处理任务。
-        - transformation一词隐含了单身操作的意思，也就是rdd1使用transformation()之后会生成新的rdd2，而不会对rdd1本身进行修改。这点和普通面向对象程序中的对象不同。
+        - transformation一词隐含了单向操作的意思，也就是rdd1使用transformation()之后会生成新的rdd2，而不会对rdd1本身进行修改。这点和普通面向对象程序中的对象不同。
         - 在Spark中，因为数据操作一般是单向操作，通过流水线执行，还需要进行错误容忍等，所以被设计成一个不可变类型。
     4. 计算结果处理：
         - 由于RDD实际上是分布在不同机器上的，所以大数据应用的结果计算分为两种方式：一种是直接将结果放进HDFS中，这种方式一般不需要在Driver端进行集中运算；另一种方式则是需要在Driver端进行集中运算，如统计RDD中的元素数目，需要先使用多个task统计每个RDD中分区(partition)的元素数目，再将它们汇集到Driver端进行加和计算。
@@ -222,7 +222,10 @@
 - collectAsMap(): Map[K,V]：将rdd1中的<K,V> record收集到Driver端，得到<K,V> Map。
 - 这两个操作的逻辑比较简单，都是将RDD中的数据直接汇总到Driver端，类似count操作的流程图。在数据量较大时两者都会造成大量内存消耗。
 - foreach(func): Unit和foreachPartition(func): Unit：将rdd1中的每个record按照func进行处理；将rdd1中的每个分区中的数据按照func进行处理。这俩的关系类似于map和mapPartitions的关系。但不同的是foreach操作一般会直接输出计算结果，并不形成新的RDD。
-- fold(zeroValue)(func): T/reduce(func): T/aggregate(zeroValue)(seqOp, combOp): U：将rdd1中的record按照func进行聚合，func语义与foldByKey(func)中的func相同；将rdd1中的record按照func进行聚合，func语义与reduceByKey(func)中的func相同；将rdd1中的record进行聚合，seqOp和combOp的语义与aggregateByKey(zeroValue)(seqOp, combOp)中的类似。这几个操作与xxxByKey的区别在于后者会生成新的RDD，而前者直接计算出结果，并不生成新的RDD。会先在rdd1的每个分区中计算局部结果，然后在Driver端将局部结果聚合成最终结果。需要注意的是fold操作中每次聚合时初始值zeroValue都会参与计算，而foldByKey在聚合来自不同分区的record时并不使用初始值；aggregate操作中seqOp和combOp聚合时初始值zeroValue都会参与计算，而在aggregateByKey中，初始值只参与seqOp的计算。
+- fold(zeroValue)(func): T：将rdd1中的record按照func进行聚合，func语义与foldByKey(func)中的func相同。
+- reduce(func): T：将rdd1中的record按照func进行聚合，func语义与reduceByKey(func)中的func相同。
+- aggregate(zeroValue)(seqOp, combOp): U：将rdd1中的record进行聚合，seqOp和combOp的语义与aggregateByKey(zeroValue)(seqOp, combOp)中的类似。
+- 上面三个操作与xxxByKey的区别在于后者会生成新的RDD，而前者直接计算出结果，并不生成新的RDD。会先在rdd1的每个分区中计算局部结果，然后在Driver端将局部结果聚合成最终结果。需要注意的是fold操作中每次聚合时初始值zeroValue都会参与计算，而foldByKey在聚合来自不同分区的record时并不使用初始值；aggregate操作中seqOp和combOp聚合时初始值zeroValue都会参与计算，而在aggregateByKey中，初始值只参与seqOp的计算。
 - 虽然xxxByKey可以对每个分区中的record以及跨分区且具有相同Key的record进行聚合，但这些聚合都是在部分数据上进行的，不是针对所有record进行全局聚合，因此当我们需要全局聚合结果时需要对这些部分聚合结果进行merge，而这个merge操作就是xxxByKey对应的xxx。这几个操作的共同问题是，当需要merge的部分结果很大时，数据传输量很大，而且Driver是单点merge，存在效率和内存空间限制问题。因此，Spark对这些聚合操作进行了优化，提出了下面两个操作。
 - treeAggregate(zeroValue)(seqOp, combOp, depth): U：将rdd1中的record按照树形结构进行聚合，seqOp和combOp的语义与aggregate中的相同，树的高度默认值为2。
 - treeReduce(func, depth): T：将rdd1中的record按树形结构进行聚合，func的语义与reduce(func)中的相同。
@@ -255,3 +258,58 @@
     1. Spark中的操作都是单向操作，单向的意思是中间数据不可修改。在普通Java程序中，数据结构中存放的数据是可以直接被修改的，而在Spark中只能生成新的数据作为修改后的结果。
     2. Spark中的操作是粗粒度的。粗粒度操作是指RDD上的操作是面向分区的，也就是每个分区上的数据操作是相同的。假设处理partition1上的数据时需要partition2的数据，并不能通过RDD的操作访问到partition2的数据，只能通过添加聚合操作来将数据汇总在一起处理，而普通Java程序的操作是细粒度的，随时可以访问数据结构中的数据。
 - 上述两个缺点也是并行化设计权衡后的结果，即这两个缺点是并行化的优点，粗粒度可以方便并行执行，单向操作有利于错误容忍。
+
+## 第4章 Spark物理执行计划
+### 4.1 Spark物理执行计划概览
+- MapReduce、Spark等大数据处理框架的核心思想是将大的应用拆分为小的执行任务。面对复杂的数据处理流程，Spark应该如何拆分呢？
+    - 想法1：一个直观的想法是将每个具体的数据操作作为一个执行阶段stage，也就是将前后关联的RDD组成一个执行阶段。这样虽然可以解决任务划分问题，但存在多个性能问题。第一个性能问题是会产生很多个任务，导致调度的压力增加。第二个性能问题是需要存储大量的中间数据。
+    - 想法2：优化想法1，通过减少任务数量。仔细观察逻辑处理流程图会发现中间数据只是暂时有用的，中间数据（RDD）产生后只用于下一步计算操作，而下一步计算操作完成后中间数据就可以被删除。那么，不如干脆将这些计算操作串联起来，只用一个执行阶段来执行这些串联的多个操作，使上一步操作在内存中生成的数据被下一步操作处理完后能够及时回收，减少内存消耗。
+    - 基于上述的串联思想，接下来需要解决两个问题：
+        1. 每个RDD包含多个分区，如何确定需要生成的任务数？如果RDD中的每个分区的计算逻辑相同，可以独立计算，那就可以将每个分区上的操作串联为一个task，也就是为最后的RDD的每个分区分配一个task。
+        2. 如何串联操作？遇到复杂的依赖关系如宽依赖要怎么处理？比如某些操作如cogroup、join的输入数据RDD可以有多个，而输出RDD一般只有一个，这时可以将串联的顺序调整为从后向前。从最后的RDD开始向前串联，当遇到宽依赖时，将该分区所依赖的上游数据（parent RDD）及操作都纳入一个task中。然而这个方案仍然存在性能问题，当遇到宽依赖时，task包含很多数据依赖和操作，导致划分出的task可能太大，而且会出现重复计算。虽然我们可以在计算完成后缓存这些需要重复计算的数据以便后续task的计算，但这样会占用存储空间，并且使得task不能同时并行计算，降低了并行度。
+    - 想法3：想法2的缺点是task会变得很大，降低并行度。问题根源是宽依赖导致的重复计算，那不如直接将宽依赖前后的计算逻辑分开，形成不同的计算阶段和任务，这样就避免了task过大的问题。Spark实际上就是基于这个思想设计的。
+### 4.2 Spark物理执行计划生成方法
+1. 执行步骤
+    - Spark采用3个步骤生成物理执行计划：
+    1. 根据action操作顺序将应用划分为作业（job）：这一步主要解决何时生成job，以及如何生成job逻辑处理流程。当应用程序出现action操作时表示应用会生成一个job，该job的逻辑处理流程为从输入数据到resultRDD的逻辑处理流程。
+    2. 根据宽依赖关系将job划分为执行阶段（stage）：对于每个job，从其最后的RDD往前回溯整个逻辑处理流程，如果遇到窄依赖，则将当前RDD的parent RDD纳入，并继续往前回溯。当遇到宽依赖时停止回溯，将当前已经纳入的所有RDD按照其依赖关系建立一个执行阶段。
+    3. 根据分区计算将各个stage划分为计算任务（task）：执行完第2步之后，整个job被划分了大小适中（相较于想法2中的划分方法）、逻辑分明的执行阶段stage。接下来的问题是如何生成计算任务。之前的想法是每个分区上的计算逻辑相同，而且是独立的，因此每个分区上的计算可以独立成为一个task。Spark便采用了这种策略，根据每个stage中最后一个RDD的分区个数决定生成task的个数。
+2. 相关问题
+    - 经过上面3个步骤，Spark可以将一个应用的逻辑处理流程划分为多个job，每个job划分为多个stage，每个stage可以生成多个task，而同一个阶段中的task可以同时分发到不同的机器并行执行。看似完美，但还有3个执行方面的问题：
+    1. 如何确定一个应用内不同job、stage和task的计算顺序：job的提交时间与action被调用的时间有关，当应用程序执行到rdd.action()时就会立即将其形成的job提交给Spark。job的逻辑处理流程实际上是DAG图，划分stage后仍然是DAG。每个stage的输入数据要么是job的输入数据，要么是上游stage的输出结果，因此计算顺序从包含输入数据的stage开始顺着依赖关系依次执行，仅当上游的stage都执行完成后才执行下游的stage。stage中每个task因为是独立而且同构的，可以并行运行没有先后之分。
+    2. task内部数据的存储与计算问题（流水线计算）：想法2中提出的解决方案是每计算出一个中间数据（RDD中的一个分区）就将其存放在内存中，等下一个操作处理完成并生成新的RDD中的一个分区后，回收上一个RDD在内存中的数据。虽然可以减少内存空间占用，但当某个RDD中的分区数较多时仍然会占用大量内存。进一步观察RDD分区之间的关系可以发现上游分区包含的record和下游分区包含的record之间经常存在一对一的数据依赖关系。
+        - 流水线式计算的好处是可以有效地减少内存使用空间，在task计算时只需要在内存中保留当前被处理的单个record即可，不需要保存其他record或已经被处理完的record。
+        - 当分区之间存在多对一关系如zipPartitions时，流水线可以直接流过zipPartitions中的iter.next()方法进行计算，zipPartitions需要在内存中保存这些中间结果直到所有record流完。有些逻辑简单的算子可以省去用集合存储中间数据比如求max值，只需要保存当前最大值即可。
+        - 当分区之间存在沙漏状的一对多关系如mapPartitions时，由于下游需要等上游数据都算出后才能计算得到结果，因此上游的输出结果需要保存在内存中，当下游函数计算完中间数据的每个record后就可以对该record进行回收。
+        - 当分区之间存在沙漏状的多对多关系时会退化成‘计算-回收’模式，每执行完一个操作，回收之前的中间计算结果。
+        - 总结：Spark采用流水线式计算来提高task的执行效率，减少内存使用量，但对于某些需要聚合中间计算结果的操作，还是需要占用一定的内存空间，这会在一定程度上影响流水线计算的效率。
+    3. task间的数据传递与计算问题：stage之间存在的依赖是宽依赖，也就是下游stage中每个task需要从parent RDD的每个分区中获取部分数据。宽依赖的数据划分方法包括Hash划分、Range划分等，要求上游stage预先将输出数据进行划分，按照分区存放，分区个数与下游task的个数一致，这个过程被称为'Shuffle Write'。下游task会将属于自己分区的数据通过网络传输获取，然后将来自上游不同分区的数据聚合在一起进行处理，这个过程被称为'Shuffle Read'。
+3. stage和task命名方式
+    - MapReduce中stage只包含两类：map stage和reduce stage，map stage中包含多个执行map函数的任务，被称为map task；reduce stage中包含多个执行reduce函数的任务，被称为reduce task。
+    - 在Spark中，stage可以有多个，有些stage既包含类似reduce的聚合操作又包含map操作，所以不用map/reduce来命名，而是直接使用stage i来命名。只能当生成的逻辑处理流程类似MR的两个执行阶段时才会习惯性区分map/reduce stage。
+    - 如果task的输出结果需要进行Shuffle Write，以便传递给下一个stage，那这些task被称为ShuffleMapTasks
+    - 如果task的输出结果被汇总到Driver端或直接写入分布式文件系统，那这些task被称为ResultTasks。
+4. 快速了解一个应用的物理执行计划
+    - 可以利用Spark UI界面提供的信息快速分析Spark的物理执行图。包括生成的job、job中包含的stage、每个stage中Shuffle Write和Shuffle Read的数据量。还可以单击DAG Visualization查看stage之间的数据依赖关系。
+    - 进入Details for stage i的界面可以看到每个stage包含的task信息，包括Shuffle Write的数据量和record条数。
+### 4.3 常用数据操作生成的物理执行计划
+- OneToOneDependency：
+    1. map, mapValues, filter, filterByRange, flatMap, flatMapValues, sample, sampleByKey, glom, zipWithIndex, zipWithUniqueId等，针对每个record进行func操作，输出一个或多个record。
+    2. mapPartitions, mapPartitionsWithIndex等，针对一个分区中的数据进行操作，输出一个或多个record。
+    - 上面两类操作唯一不同是操作1每读入一条record就处理和输出一条，而操作2等到分区中的全部record都处理完后再输出record。每个task处理一个分区。
+- RangeDependency：
+    - 有着不同partitioner的RDD之间的union，会直接将多个RDD的分区直接合并在一起，每个task处理一个分区。
+- ManyToOndeDependency：
+    - shuffle为false的coalesce，partitioner相同的RDD之间的union，zip，zipPartitions等，使用多对一窄依赖将parent RDD中多个分区聚合在一起。
+    - child RDD中每个分区需要从parent RDD中获取所依赖的多个分区的全部数据。
+    - 此stage生成的task个数与最后RDD的分区个数相等，每个task需要同时在parent RDD中获取多个分区中的数据。
+- ManyToManyDependency：
+    - cartesian等，使用复杂的多对多窄依赖将parent RDD中的多个分区聚合在一起。
+    - child RDD中的每个分区需要从多个parent RDD中获取所依赖分区的全部数据。此stage生成的task个数与最后的RDD分区个数相等。
+- 单一ShuffleDependency：
+    - partitionBy, groupByKey, reduceByKey, aggregateByKey, combineByKey, foldByKey, sortByKey, coalesce(shuffle=true), repartition, repartitionAndSortWithinPartitions, sortBy, distinct等，使用宽依赖将parent RDD中的数据进行重新划分和聚合。
+    - 单一shuffle指的是child RDD只与一个parent RDD形成宽依赖。每个stage中的task个数与该stage中最后一个RDD中的分区个数相等。
+    - 为了进行跨stage的数据传递，上游stage中的task将输出数据进行Shuffle Write，child stage中的task通过Shuffle Read同时获取parent RDD中多个分区中的数据。与窄依赖不同，这里从parent RDD的分区中获取的数据是划分后的部分数据。
+- 多ShuffleDependency：
+    - cogroup, groupWith, join, intersection, subtract, subtractByKey等，使用宽依赖将多个parent RDD中的数据进行重新划分和聚合。
+    - 下游stage需要等上游stage完成后再执行，Shuffle Read获取上游stage的输出数据。
