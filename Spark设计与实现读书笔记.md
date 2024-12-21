@@ -399,7 +399,7 @@
 - 在生成邻接表后，根据邻接表将rank值分发给邻居节点，该表中的每个分区包含一部分节点以及出边到达的邻居节点，这种划分方式类似Pregel的边划分方式。
 
 # 第四部分 大数据处理框架性能和可靠性保障机制
-## 第六章 Shuffle机制
+## 第6章 Shuffle机制
 ### 6.1 Shuffle的意义以及设计挑战
 - Shuffle解决的问题是如何将数据重新组织，使其能够在上游和下游task之间进行传递和计算。
 - 如果是单纯的数据传递，只需要将数据进行分区、通过网络传输即可。但Shuffle机制还需要进行各种类型的计算（如聚合、排序），而且数据量一般会很大，所以支持不同类型的计算和提高Shuffle的性能是一大设计难点。
@@ -529,7 +529,7 @@
     - 缺点：强制按照Key排序对于一些不需要排序的操作如groupByKey来说增加了计算量；不支持在线聚合，需要分阶段进行，导致消耗大量的内存和磁盘空间；产生的临时文件过多，比如map stage产生的分区文件数量为map task个数乘以reduce task个数。
 - 针对Hadoop的Shuffle的缺点，Spark通过对操作类型分类来应对不同操作的排序需求，避免了强制按Key排序；使用AppendOnlyMap等数据结构通过hash-based聚合实现了在线聚合；将多个分区文件合并为一个分区文件避免了临时文件数多的问题（Spark按照PID进行排序的原因）。
 - 另外，由于Hadoop MapReduce采用独立阶段聚合，Spark使用在线聚合，两者的聚合函数存在一个很大的区别：Hadoop的reduce函数接收<K, list(V)>，可以对每个record中的list(V)进行任意处理，而Spark的reduce函数每接收到一个<K, V>都要进行处理，流程上会有一些受限。
-## 第七章 数据缓存机制
+## 第7章 数据缓存机制
 ### 7.1 数据缓存的意义
 - 例如，迭代型应用如果每轮迭代时都需要读取一个固定数据（如训练数据的特征矩阵或输入图）来进行计算，或交互式应用（如交互式SQL）需要不断地对一个固定数据进行查询分析（执行不同的SQL语句）。
 ### 7.2 数据缓存机制的设计原理
@@ -588,3 +588,66 @@
 - DistributedCache将缓存文件存放在每个worker的本地磁盘上，而不是内存中。
 - 当前Spark缓存的RDD数据是只读的，不能修改，也不能根据RDD的生命周期进行自动缓存替换。
 - Spark的缓存机制只能用于单个Spark应用内部，即只能在应用的job之间共享，而无法在不同应用间共享。针对这个问题有Spark研究者开发了分布式内存文件系统Alluxio（挖坑《Alluxio：大数据统一存储原理与实践》）。
+## 第8章 错误容忍机制
+### 8.1 错误容忍机制的意义及挑战
+- 对于Spark等大数据处理框架，错误容忍需要考虑以下两方面的问题：
+    1. 作业job执行失败问题：具体表现有task长时间无响应、内存溢出、IO异常、数据丢失等。原因多种多样，既包括硬件问题如节点宕机、网络阻塞、磁盘损坏等；也包括软件问题如内存资源分配不足、partition配置过少导致task处理的数据规模太大、partition划分不当引起的数据倾斜，以及用户和系统Bug等。
+    2. 数据丢失问题：job在执行过程中，会读取输入数据、生成中间数据、输出结果。在故障的情况下会导致它们丢失。例如，task的输入文件既可以来自分布式文件系统，也可以通过Shuffle获取，那么在Shuffle机制中数据丢失怎么办？如果对数据进行缓存后，缓存数据由于节点宕机等故障丢失怎么办。另外，如果当前job的输出数据是下一个job的输入数据，当前job的输出数据丢失怎么办？
+### 8.2 错误容忍机制的设计思想
+- Spark没有很好的办法解决上述的各种问题，但它会优先解决一类较为简单的错误：由于执行环境改变而引发的应用执行失败，如节点宕机、内存竞争、IO异常导致的任务执行失败。它们的共同特点是可以通过重新计算来尝试修复（比如调度到正常的机子上）。
+- 对于数据丢失问题，数据库中有一些方案如写日志、数据持久化、复制备份等。Spark采用的是数据检查点持久化方案，即checkpoint机制。
+- 总结：Spark的错误容忍机制核心思想是重新执行计算任务和通过checkpoint机制进行数据持久化。
+### 8.3 重新计算机制
+- 由于Spark应用执行流程的复杂性，在设计精确和高效的重新计算机制时需要考虑下面这些问题：
+#### 8.3.1 重新计算是否能够得到与之前一样的结果
+- 要保证重新计算的一致性，需要task的输入数据和计算逻辑满足以下3个特性：
+1. task的输入数据一致：对于map task，输入数据一般来自分布式文件系统或上一个job的输出。分布式文件系统一般是静态可靠的，上一个job的输出也可以通过持久化来获得相同的数据。对于reduce task，输入数据通过Shuffle获取，即便Shuffle Write的partition函数固定的前提下，Shuffle Read也由于计算延迟和网络延迟无法保证接收到的record的顺序性，比如可能先收到map task2的record，后收到map task1的record，这种情况下reduce task再次运行时的输入数据与之前的数据是部分一致的，也就是说集合相同，但record顺序不同，因此需要满足下面两种条件。
+2. task的计算逻辑需要满足确定性(deterministic)：意思是当输入数据是确定的，通过计算得到的结果也是确定的。
+3. task的计算逻辑需要满足幂等性(idempotent)：意思是对同样数据进行多次运算，结果都是一致的。
+- 总结：重新计算机制有效的前提条件：task重新执行时能够读取与上次一致的数据，并且计算逻辑具有确定性和幂等性。
+#### 8.3.2 从哪里开始重新计算
+- Spark运行应用会按照action操作的先后顺序提交job，每个job被分为多个stage，每个stage又包含多个task，task是最小的执行单位。
+- Spark采用了延时删除策略，将上游stage的Shuffle Write结果写入本地磁盘，并且在当前job完成后，才删除这些数据。
+- 对于一个task而言，其上游RDD的数据如果没有缓存，就需要重算。
+- 重新计算时只需要重新计算task对应的上游分区部分，而不需要重新计算整个RDD的数据。
+- Spark采用了一种称为lineage的数据溯源方法，其核心思想是在每个RDD中记录其上游数据是什么以及当前RDD是如何通过上游计算得到的。这样在错误发生时，可以根据lineage追根溯源，找到计算当前RDD所需的数据和操作。
+- lineage的本质就是第3章中讲述的数据依赖关系，这个依赖关系不仅可以用于划分stage，还可以用于在错误发生时回溯需要重新计算的数据。
+### 8.4 checkpoint机制的设计与实现
+- 重新计算机制的缺点是当某个RDD的计算链过长，重新计算该数据的代价会非常高。
+- checkpoint机制的核心思想是将计算过程中某些重要数据进行持久化，再次执行时可以从检查点执行，减少重新计算的开销。
+#### 8.4.1 哪些数据需要使用checkpoint机制
+- 在单个job中，如果RDD涉及聚合，或依赖数据较多，就建议用checkpoint对其进行持久化。
+- 多个job的情况，还需要考虑job之间传递的数据是否需要checkpoint。在串联执行的job，尤其是迭代型应用中，每一轮迭代都是一个job，为了避免错误恢复时重新从第1轮迭代开始导致的计算代价，需要每隔几个job就对一些中间数据进行checkpoint。
+- 缓存可能会因为缓存替换或宕机而失效，checkpoint不会。
+#### 8.4.2 checkpoint数据的写入及接口
+- checkpoint的数据量可能很大，一般采用分布式文件系统如HDFS来存储，或在内存空间足够的情况下选择基于内存的分布式文件系统Alluxio。
+- Spark中提供了sparkContext.setCheckpointDir(directory)接口来设置checkpoint的存储路径，以及rdd.checkpoint()来实现checkpoint。
+#### 8.4.3 checkpoint时机及计算顺序
+- 缓存每计算一条record就缓存一次，checkpoint也一样，但它需要写到HDFS上，中间会涉及跨节点磁盘写入以及冗余备份等操作，时延较高。
+- 如果需要checkpoint的RDD包含的数据量很大，会严重影响job的执行时间，造成很高的磁盘IO代价。Spark采取的权宜之计是当用户设置rdd.checkpoint()后只标记某个RDD需要持久化，计算过程也像正常一样计算，等当前job计算结束时再重新启动该job，对其中需要checkpoint的RDD进行持久化，也就是说当前job结束后会另外启动专门的job完成checkpoint，因此需要checkpoint的RDD会被计算两次。
+- checkpoint启动额外job来进行持久化会增加计算开销，所以Spark推荐用户将需要被checkpoint的数据先进行缓存，这样额外启动的job只需要将缓存数据进行checkpoint即可，不需要再重新计算RDD，以提高效率。
+#### 8.4.4 checkpoint数据的读取
+- checkpoint数据存储在HDFS上，读取方式与从HDFS读取输入数据没什么太大区别，都是启用task来读取的，并且每个task读取一个分区。只有以下2个不同点：
+1. checkpoint数据格式为序列化的RDD，因此需要进行反序列化重新恢复RDD中的record。
+2. **checkpoint时存放了RDD的分区信息**，如使用了什么partitioner。重新读取后不仅恢复了RDD数据，也可以恢复其分区方法信息，便于决定后续操作的数据依赖关系，比如决定之后的join操作应该使用OneToOneDependency还是ShuffleDependency。
+#### 8.4.5 checkpoint数据写入和读取的实现细节
+- RDD需要经过[Initialized -> CheckpointingInProgress -> Checkpointed]三个阶段才能真正被checkpoint。
+1. Initialized：当应用程序使用rdd.checkpoint()设定某个RDD需要被checkpoint时，Spark为该RDD添加一个checkpointData属性，用于管理该RDD相关的checkpoint信息，比如checkpoint的路径及Initialized状态。
+2. CheckpointingInProgress：当前job结束后，会调用该job最后一个RDD的doCheckpoint()方法。该方法根据RDD的computing chain回溯扫描，遇到需要被checkpoint的RDD就将其标记为CheckpointintInProgress。之后，Spark会调用runjob()再次提交一个job完成checkpoint。
+3. Checkpointed：再次提交的job完成RDD的checkpoint后，Spark会建立一个newRDD，类型为ReliableCheckpointRDD，用于表示被checkpoint到磁盘上的RDD。newRDD会保留数据的分区信息，但会将lineage截断(dependencies_=null)，不再保留依赖的数据和计算，因为RDD已被持久化到可靠的分布式文件系统，无需保留用于回溯的lineage信息。
+- newRDD的分区类型为CheckpointedRDDPartition，表示该分区已经被持久化。
+- 生成newRDD后，Spark会将数据与newRDD进行关联，当后续job需要读取这部分数据时，会去读取newRDD。
+- 总结：checkpoint的写入过程不仅对RDD进行持久化，还会切断该RDD的lineage，将该RDD与持久化到磁盘上的CheckpointedRDD进行关联，并影响后续对该RDD的读取。
+#### 8.4.6 checkpoint语句位置的影响
+- checkpoint两个job的两个RDD时会为每个RDD多生成一次job计算，但处于下游job的RDD在checkpoint时会直接使用上游job的RDD的checkpoint job中的stage输出数据和Shuffle Write到本地磁盘上的数据，这些数据会等下游job的RDD的checkpoint完成后再删除。这与一般的job不同，因为一般的job会在job完成后立刻删除其上游stage和Shuffle Write到磁盘上的数据。
+- checkpoint方法放到action语句后会不被执行，因为checkpoint方法只是对RDD做标识，需要在运行action job的过程中完成标识，如果action job已经运行完成，就不会对RDD进行标识。
+- 在一个job中对多个RDD进行checkpoint时，只有最后一个RDD会被checkpoint，因为目前checkpoint的实现机制是从后往前扫描，先碰到的RDD会被checkpoint，同时将其上游依赖关系lineage设置为空，没有必要继续往前回溯。（这有可能会引发问题，所以Spark将这个问题列为了TODO，拟采用的解决方法是从前往后扫描）
+#### 8.4.7 cache+checkpoint
+- 前面提到，Spark建议用户在checkpoint RDD的同时对其进行缓存，这种情况下会先生成第一个job，这个job会在运行时对数据进行缓存，然后启动第2个job读取缓存并进行checkpoint，最后启动第3个job读取缓存并进行后续操作。第3个job会优先读取缓存数据，再读取checkpoint数据。
+- checkpoint会切断lineage，这对于迭代型应用很重要，因为这类应用的lineage往往会很长，及时进行checkpoint可以减少job复杂程度，降低再次运行时的计算开销。如果单纯为了降低job lineage的复杂程度而不是为了持久化，可以使用Spark提供的localCheckpoint()方法，其等价于数据缓存+切断lineage的功能（缓存失效怎么办？）。
+### 8.5 checkpoint与数据缓存的区别
+1. 目的：数据缓存的目的是加速后续运行的job的计算，而checkpoint的目的是在job运行失败后能够快速恢复。
+2. 存储性质与位置：数据缓存为了读写速度快，主要使用内存，偶尔使用磁盘。checkpoint为了实现可靠读写，主要使用分布式文件系统作为存储空间。
+3. 写入速度和规则：数据缓存速度较快，对job的执行时间影响较小，因此可以在job运行时进行缓存。而checkpoint的写入速度慢，为了减少对当前job的时延影响，会额外启动专门的job进行持久化。
+4. 对lineage的影响：对RDD进行缓存后，该RDD的lineage不会受到影响，这样缓存后的RDD丢失时可以通过重新计算得到。而RDD进行checkpoint后，会切断该RDD的lineage，因为它已经被可靠存储。
+5. 应用场景：数据缓存适用于被多次读取、占用空间不是非常大的RDD。checkpoint适用于数据依赖关系比较复杂、重新计算代价较高的RDD，如关联数据较多、计算链较长、被多次重复使用等。
