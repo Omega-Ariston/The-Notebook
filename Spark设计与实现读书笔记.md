@@ -651,3 +651,144 @@
 3. 写入速度和规则：数据缓存速度较快，对job的执行时间影响较小，因此可以在job运行时进行缓存。而checkpoint的写入速度慢，为了减少对当前job的时延影响，会额外启动专门的job进行持久化。
 4. 对lineage的影响：对RDD进行缓存后，该RDD的lineage不会受到影响，这样缓存后的RDD丢失时可以通过重新计算得到。而RDD进行checkpoint后，会切断该RDD的lineage，因为它已经被可靠存储。
 5. 应用场景：数据缓存适用于被多次读取、占用空间不是非常大的RDD。checkpoint适用于数据依赖关系比较复杂、重新计算代价较高的RDD，如关联数据较多、计算链较长、被多次重复使用等。
+## 第9章 内存管理机制
+### 9.1 内存管理机制问题及挑战
+1. 内存消耗来源多种多样，难以管理。
+    1. 框架本身处理数据时消耗的内存，如Spark在Shuffle Write/Read过程中使用类似HashMap和Array的数据结构对数据进行聚合和排序。
+    2. 数据缓存消耗的内存。
+    3. 用户代码消耗的内存，如用户在reduceByKey(func)、mapPartitions(func)的func中自己定义的数据结构。
+2. 内存消耗动态变化、难以预估。如Shuffle机制中的内存用量与Shuffle数据量、分区个数、用户自定义的聚合函数等相关，并且这些内存消耗来源产生的内存对象的生命周期不同。
+3. task之间共享内存，导致内存竞争。在Hadoop MapReduce中，框架为每个task启动一个单独的JVM运行，task之间没有内存竞争。在Spark中，多个task以线程方式运行在同一个Executor JVM中，存在内存共享和竞争。
+### 9.2 应用内存消耗来源及影响因素
+- 内存消耗的定义
+    - Hadoop MapReduce中，map/reduce task以JVM进城方式运行，因此Hadoop MapReduce应用内存消耗指的是map/reduce task进程的内存消耗。
+    - Spark应用的task（名为ShuffleMapTask或ResultTask）以线程方式运行在Executor JVM中。因此，Spark应用的内存消耗在微观上指task线程的内存消耗，宏观上指的是Executor JVM的内存消耗。
+- 单个task的内存消耗来源主要以下包含3个方面：
+1. 用户代码
+    - 影响因素包括数据操作的输入数据大小、以及func的空间复杂度。
+    - 输入数据大小决定用户代码会产生多少中间计算结果。
+    - func的空间复杂度决定多少中间计算结果会被保存在内存中。
+    - Spark在运行时可以获得数据操作的输入数据信息，如map()读入了多少个record，groupByKey()通过Shuffle Read读取了多少个record等。但record会产生多大的中间计算结果，中间计算结果占用的内存由用户代码的空间复杂度决定，难以预先估计。
+2. Shuffle机制中产生的中间数据
+    - Shuffle Write：如果这个阶段需要进行combine聚合，Spark会将record存放到类似HashMap的数据结构中进行聚合，会占用大量内存空间。并且之后Spark会按照partitionId或Key对record进行排序，这个过程中可能会使用数组保存record，也会消耗一定的内存空间。
+    - Shuffle Read：这个阶段会分配一个缓冲区暂存从不同map task获取的record，需要消耗一些内存。如果需要对数据进行聚合，Spark将采用类似HashMap的数据结构对这些record进行聚合，会占用大量内存空间。相似地，如果需要对Key排序，也会有数组的内存消耗。
+    - Shuffle机制中内存消耗的影响因素：是否需要聚合和排序、数据量大小、用户定义的聚合函数的空间复杂度。
+    - 这些内存消耗难以在task运行前进行估计，Spark采用了动态监测的方法，在Shuffle机制中动态监测HashMap等数据结构大小，动态调整数据结构长度，并在内存不足时将数据spill到磁盘中。
+3. 缓存数据
+    - 缓存数据的内存消耗影响因素：需要缓存的RDD大小、缓存级别、是否序列化等。
+    - 当某个RDD需要缓存时，Spark需要在计算RDD的过程中将其record写入内存或磁盘。Spark无法提前预测缓存数据大小，只能在写入过程中动态监控当前缓存数据大小。
+    - 缓存数据存在替换和回收机制，因此缓存数据在运行过程中大小是动态变化的。
+### 9.3 Spark框架内存管理模型
+#### 9.3.1 静态内存管理模型
+- 由于内存消耗包含上述三种来源并且内存空间是连续的，所以一个简单的解决方法是将内存空间划分为3个分区，每个分区负责存储3种内存消耗来源中的一种，并根据经验确定三者的空间比例。
+- Spark1.6以前的早期版本采用了静态内存管理模型的方法，将内存空间划分为了3个分区。
+    1. 数据缓存空间(Storage memory)：约占60%的空间，用于存储RDD缓存数据、广播数据（如第5章中的参数w）、task的一些计算结果等。
+    2. 框架执行空间(Execution memory)：约占20%的内存空间，用于存储Shuffle机制中的中间数据。
+    3. 用户代码空间(User memory)：约占20%的内存空间，用于存储用户代码的中间计算结果、Spark框架本身产生的内部对象，以及Executor JVM自身的一些内存对象等。
+- 静态划分的优点是各个分区的角色分明、实现简单，缺点是分区之间存在“硬”界限，难以平衡三者的内存消耗。比如GroupBy和join等应用需要较大的框架执行空间用于存放Shuffle的中间数据，并不需要太多的数据缓存空间。
+- 为了增加静态划分的灵活性，Spark允许用户自己设定三者的空间比例，但对于普通用户来说很难确定一个合适的比例，而且内存用量在运行过程中不断变化，不存在最优的静态比例，容易造成内存资源浪费、内存溢出等问题。
+#### 9.3.2 统一内存管理模型
+- 为了平衡用户代码、Shuffle中间数据、数据缓存的内存空间需求，最理想的方法是为三者分配一定的内存配额，并在运行时根据三者的实际内存用量动态调整配额比例。
+- 9.2中提到过用户代码的内存消耗难以被监控和估计，所以优化后的内存管理机制主要是根据监控得到的内存用量信息来动态调节用于Shuffle机制和用于缓存数据内存空间的。
+- 三者的内存消耗量不能超过实际内存大小，所以除了内存动态调整外还需要进行内存配额限制。一个解决方案是为每个内存消耗来源设定一个上下界，其内存配额在上下界范围内动态可调。
+- 根据上述思想，从Spark1.6开始实现了更高效的统一内存管理模型(UnifiedMemoryManager)，仍然将内存划分为3个区，但使用“软”界限来调整分区的占用比例。
+- 在三个分区中，数据缓存空间和框架执行空间共享一个大空间，称为Framework memory，其大小固定，并且为两个分区设置了初始比例，这个比例可以在应用执行过程中动态调整，相互借用，但也存在上下界。
+- Spark将用户代码空间设定为了固定大小，因为这部份内存难以在运行时获取真实消耗或动态设定比例。
+- 框架执行空间不足时，会将Shuffle数据spill到磁盘上，当数据缓存空间不足时，Spark会进行缓存替换、移除缓存数据等操作。
+- Spark会限制每个task的内存使用，进行限额。
+- Executor JVM的整个内存空间划分为以下3个部份。
+    1. 系统保留内存(Reserved Memory)：使用较小的空间存储Spark框架产生的内部对象，如Spark Executor、TaskMemoryManager等，这部份内存通过spark.testing.ReservedMemory设置，默认为300MB。
+    2. 用户代码空间(User Memory)：被用于存储用户代码生成的对象，如map中用户定义的数据结构，这部份空间默认为40%的内存空间。
+    3. 框架内存空间(Framework Memory)：包括框架执行空间(Execution Memory)和数据缓存空间(Storage Memory)。总大小为spark.memory.fraction（默认为0.6 * heap-reserved memory）。数据缓存空间会确保拥有其中至少50%的配额。数据缓存空间会借用框架执行空间，并在空闲时归还。框架执行空间也会向缓存数据空间借用内存，**但并不会归还**（难以代码实现）。
+- Framework Memory的堆外内存空间
+    - 为了减少GC的开销，Spark的统一内存管理机制允许使用堆外内存，使用C/C++语言分配的malloc空间，不受JVM垃圾回收机制管理，在结束使用时需要手动释放空间。
+    - 堆外内存主要存储序列化对象数据，用户代码处理普通Java对象，因此堆外内存只用于框架执行空间和数据缓存空间，不用于用户代码空间。
+    - 如果设置了堆外内存，其大小由spark.memory.offHeap.size设置，并且也会按照比例分配执行空间和数据缓存空间，管理方式与堆内相同。
+- Spark会在运行应用时根据应用的Shuffle方式以及用户设定的数据缓存级别来决定使用堆内内存还是堆外内存。如SerializedShuffle方式可以利用堆外内存来进行Shuffle Write，再如用户使用rdd.persist（OFF_HEAP）后可以将rdd存储到堆外内存。
+- 虽然Spark内存模型可以限制框架使用的空间大小，但无法控制用户代码的内存消耗量。用户代码运行时的实际内存消耗量可能超过用户代码空间的界限，侵占框架使用的空间，此时如果框架也使用了大量内存空间，则可能造成内存溢出。
+### 9.4 Spark框架执行内存消耗与管理
+- 内存共享与竞争
+    - 运行过程中，Executor中活跃的task数目在[0, ExecutoreCores]间变化
+    - 为了公平性，每个task可使用的内存空间被均分，也就是空间大小被控制在[1/2N, 1/N] * ExecutorMemory内，N是当前活跃的task数目。
+    - 后加入的task在计算可用内存时会根据最新的task数来计算。
+#### 9.4.1 Shuffle Write阶段内存消耗及管理
+- 在第6章中，根据Spark应用是否需要map端聚合、按Key进行排序，将Shuffle Write分为4种：
+1. 无map端聚合、无排序且partition个数不超过200时：采用基于buffer的BypassMergeSortShuffle-Writer方式。
+    - Shuffle Write只实现数据分区功能。
+    - Spark采用的shuffle方式为buffer-based shuffle。
+    - 每当buffer填满就溢写到磁盘中。
+    - 内存消耗：buffer被分配在堆内内存中，个数与分区个数相等，生命周期直到Shuffle Write结束。因此，每个task的内存消耗为BufferSize（默认32KB）*partition number，所以只适用于分区个数较小的情况。
+2. 无map端聚合、无排序且partition个数大于200时：采用SerializedShuffleWriter。
+    - 为了解决前一种方式中对大分区数量的支持不佳，这种方式采取了基于数组排序的方法。
+    - 核心思想是分配一个大的数组，将map()输出的<K,V> record不断放进数组，然后将数组里的record按照partitionId排序，最后输出。
+    - 普通的record对象是Java对象，占用空间较大，需要的数组空间也大。因此Spark设计了SerializedShuffle方式，将record对象序列化后存放到可分页存储的数组中，序列化可以减少开销，分页可以利用不连续的空间。
+    - 使用SerializedShuffle的优点还有如下这些：
+        1. 序列化后的record占用的内存空间小。
+        2. 不需要连续的内存空间。
+        3. 排序效率高，因为此时排序的不是record本身，**而是序列化后字节数组的指针（元数据）**。这个过程不需要序列化和反序列化。
+        4. 可以使用cache-efficient sort等优化技术，提高排序性能。
+    - 使用Serialized Shuffle需要这些条件：
+        1. 不需要map端聚合，也不需要按Key进行排序。
+        2. 使用的序列化类(serializer)支持序列化Value的位置互换功能(relocation of serialized Value)，目前KryoSerializer和Spark SQL的custom serializers都支持该功能。
+        3. 分区个数小于16777216。
+        4. 单个Serialized record小于128MB。
+    - 实现方式：使用分页技术，像操作系统一样将内存空间划分为Page，每个大小在1MB-64MB，可以在堆内或堆外内存上分配。Page由Executor中的TaskMemoryManager对象来管理，其包含一个PageTable，可以最多寻址8192个Page。
+    - 对于map输出的每个<K,V> record，Spark将其序列化后写入某个Page中，再将该record的索引，包括partitionId、所在的PageNum，以及在该Page中的Offset放到PointerArray中，然后通过排序partitionId来对record进行排序。
+    - 当Page总大小达到task的内存限制时，会将这些Page中的record按照partitionId进行排序，并spill到磁盘上，最后再将这些spill文件归并。
+    - 内存消耗：PointerArray、存储record的Page、sort算法所需的额外空间，总大小不超过task的内存限制。
+    - 单个数据结构不能同时使用堆内和堆外内存，因此Serialized Shuffle使用堆外内存的最大问题是可能会造成更多的spill次数（？）。
+3. 无map端聚合、有排序：采用基于数组的SortShuffleWriter(KeyOrdering=true)方式。
+    - 具体方法是建立一个Array来存放map输出的record，并对Array中元素的Key进行精心设计，将每个<K,V> record转化为<(PID, K), V> record存储，然后按照PID+Key对record进行排序，最后将所有record写入一个文件中，通过建立索引来标示每个分区。
+    - Array存放不下时会先扩容，扩容后还存放不下时会将Array中的元素排序后spill到磁盘上。最后将Array和磁盘上的record进行全局排序并写入文件中。
+    - 内存消耗：最大的内存消耗是存储record的数组PartitionedPairBuffer，占用堆内内存，具有扩容能力，但大小不超过task的内存限制。
+4. 有map端聚合：采用基于HashMap的SortShuffleWriter(mapSideCombine=true)方式。
+    - 实现方法是建立一个类似HashMap的数据结构PartitionedAppendOnlyMap对map输出的record进行聚合，HashMap的Key是partitionId+Key，Value是经过相同combine的聚合结果。
+    - 如果不需要按Key进行排序，则只根据partitionId进行排序，如果需要按照Key进行排序，那么根据partitionId+Key进行排序。
+    - 内存消耗：HashMap在堆内分配内存，需要消耗大量内存。HashMap存放不下时会扩容为两位大小，还存放不下时会先排序record再将它们spill到磁盘上。
+    - 这种方式的优点是通用性强、对分区个数无限制，缺点是内存消耗高、不能使用堆外内存。
+- 第1、2、4三种方式利用堆内内存来聚合、排序record对象，属于Unserialized Shuffle方式。这种方式处理的是普通的Java对象，有较大的内存消耗，造成较大的JVM垃圾回收开销。
+- Spark在2.0版本中引入了Serialized Shuffle方式，直接在内存中操作序列化后的record对象（二进制数据），降低内存消耗和GC开销，也可以利用堆外内存。
+- SerializedShuffle方式由于处理的是序列化后的数据，有一些适用性上的不足，如在Shuffle Write中，只用于无map端聚合且无排序的情况。
+#### 9.4.2 Shuffle Read阶段内存消耗及管理
+- Spark设计的通用Shuffle Read框架的计算顺序为“数据获取 -> 聚合 -> 排序”
+- 在第6章中，根据Spark应用是否需要聚合、按Key进行排序，将Shuffle Read方式分为3种：
+1. 无聚合且无排序：采用基于buffer获取数据并直接处理的方式，典型操作如partitionBy()。
+    - 这种情况非常简单，只包含一个大小为spark.reducer.maxSizeInFlight=48MB的缓冲区。
+2. 无聚合但需要排序的情况：采用基于数组排序的方式，典型操作如sortByKey()。
+    - 只需要实现数据获取和按Key排序的功能，Spark采用了基于数组的排序方式。
+    - 数组空间不够时也会spill到磁盘，最后再进行内存+磁盘的全局排序。
+    - 内存消耗：由于获取的是各个上游task的输出数据，需要较大的Array(PartitionedPairBuffer)来存储和排序这些数据。Array大小可控，可扩容，可溢写，并在堆内分配。
+3. 有聚合的情况：采用基于HashMap聚合的方式，典型操作如reduceByKey()。
+    - HashMap中的Value是具有相同Key的record经过聚合函数(func)计算后的结果。
+    - HashMap空间不够时会进行spill输出，最后再进行内存+磁盘的全局排序。
+    - 内存消耗：由于获取的是各个上游task的输出数据，需要较大的HashMap，且只能使用堆内内存。HashMap的内存消耗量也与record中不同Key的个数及聚合函数的复杂度相关。HashMap具有扩容和spill到磁盘上的功能，支持不同规模数据的聚合。
+- 上述三种方式都是利用堆内内存来完成数据处理，属于Unserialized Shuffle方式。
+### 9.5 数据缓存空间管理
+- 数据缓存空间主要用于存放3种数据：RDD缓存数据(RDD partition)、广播数据(Broadcast data)、task的计算结果(TaskResult)。另外还有几种临时空间，如用于反序列化(展开iterator为Array[])的临时空间和用于存放Netty网络数据传输的临时空间。
+- 与框架执行内存空间一样，数据缓存空间也可以同时存放在堆内和堆外内存，且由task共享。但每个task的存储空间并没有被限制为1/N。
+- 缓存时如果空间不够，且不能从框架执行内存借用空间时，只能采取缓存替换或直接丢掉数据的方式。
+#### 9.5.1 RDD缓存数据
+- 是数据缓存空间最主要存储的内容，通过调用rdd.persist(Storage_Level)来缓存到内存中。
+1. MEMORY_ONLY/MEMORY_AND_DISK:
+    - task在计算需要被缓存的RDD partition时会将partition缓存到Executor的memoryStore中，memoryStore可以认为代表了堆内的数据缓存空间。
+    - memoryStore持有一个LinkedHashMap来存储和管理缓存的RDD partition。
+    - 一个Executor中可能同时运行多个task，所以这个LinkedHashMap被多个task共用，即数据缓存空间由多个task共享。
+    - 内存消耗：由存放到其中的RDD record大小决定，即等于所有task缓存的RDD partition的record总大小。
+2. MEMORY_ONLY_SER/MEMORY_AND_DISK_SER：
+    - 实现方式：与MEMORY_ONLY基本相同，唯一不同是partition中的record以序列化的方式存储在一个ChunkedByteBuffer（不连续的ByteBuffer数组）中。
+    - 使用不连续数组的目的是方便分配和回收，因为当record很多时，序列化后需要一个非常大的数组来存储，可能并没有这么大的连续空间。而Memory_ONLY就不存在这个问题，因为普通的Java对象本来就能存放在内存中的任意位置。
+    - 内存消耗：由存储的record总大小决定，即等于所有task缓存的RDD partition的record序列化后的总大小。
+3. OFF_HEAP：
+    - 实现方式：与前一种模式基本相同，只是存放位置在堆外内存。
+    - 内存消耗：存放到OFF_HEAP中的partition的原始大小。
+- 通过以上分析可知，目前堆内内存和堆外内存还是独立使用的，并没有可以同时存放到二者的缓存级别，即二者并没有协作。
+#### 9.5.2 广播数据
+- 有些应用在运行前，需要将多个task的公用数据广播到每个节点，如当map stage中的task都需要一部词典时，可以先将该词典广播给各个Executor，然后每个task从Executor中读取词典，因此广播数据的存储益在Executor的数据存储空间。
+- 实现方式：默认使用类似BT下载的TorrentBroadcast方式。需要广播的数据一般预先存储在Driver端，Spark将其划分为spark.Broadcast.blockSize=4MB的数据块，然后赋予每块一个BroadcastblockId。之后使用类似BT的方式将每个block广播到每个Executor中。Executor接收到每个block数据块后将其放到堆内的数据缓存空间的ChunkedByteBuffer（不连续的空间）里，缓存模式为MEMORY_AND_DISK_SER。
+- 内存消耗：序列化后的Broadcast block总大小。
+- 存放方式为内存+磁盘，在内存不足时会放入磁盘。
+#### 9.5.3 task的计算结果
+- 许多应用需要在Driver端收集task的计算结果并进行处理，如调用了rdd.collect()的应用。
+- 当task的输出结果大小超过spark.task.maxDirectResultSize=1MB且小于1GB时，需要先将每个task的输出结果缓存到执行该task的Executor中，存放模式为MEMORY_AND_DISK_SER，然后Executor将task的输出结果发送到Driver端进一步处理。
+- 内存消耗：序列化后的task输出结果大小，不超过1GB（否则会引起Executo的数据缓存空间不足，因为有多个task）。
+- 存放方式为内存+磁盘，在内存不足时会放入磁盘。
